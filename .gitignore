@@ -1,0 +1,22 @@
+# Python 캐시/바이트코드
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 가상환경
+.venv/
+env/
+venv/
+
+# 시스템 파일
+.DS_Store
+Thumbs.db
+
+# 실행 결과물
+outputs/*.csv
+
+# IDE/에디터 관련
+.vscode/
+.idea/
+*.swp
+*.swo
