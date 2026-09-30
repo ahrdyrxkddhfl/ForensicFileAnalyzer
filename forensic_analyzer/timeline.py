@@ -1,145 +1,154 @@
 # forensic_analyzer/timeline.py
+"""파일 시간 정보로 타임라인(시간순 사건 목록)을 만든다.
+
+파일 하나에서 생성·메타데이터 변경·수정·접근 시각을 각각 한 줄씩 사건으로
+펼친 뒤 시간순으로 정렬한다. 여러 파일의 사건을 한 줄에 세우면 "무엇이 어떤
+순서로 일어났는지"를 볼 수 있다.
+
+시간 필드의 뜻은 OS마다 다르며, 인벤토리 단계(``inventory.platform_times``)에서
+이미 정리해 두었다. 그래서 여기서는 필드 이름대로 라벨만 붙인다.
+
+0 이하의 시각(1970-01-01 이전 또는 초기화된 값)과 현재보다 하루 이상 미래인 시각은
+버리지 않고 기록하되 ``ts_suspicious=True``로 표시한다. 시각을 조작한 흔적일 수 있기
+때문이다(``validate``의 ``TS_SUSPICIOUS``·``TS_FUTURE``와 같은 기준).
+"""
 from __future__ import annotations
-import csv
+
+import math
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
+Value = Union[str, int, float, bool, None]
 
-#api
+# 현재보다 이만큼(초) 이상 미래인 시각은 수상한 시각으로 표시한다.
+FUTURE_TOLERANCE_SEC = 86400
+
+TIMELINE_FIELDS: Tuple[str, ...] = (
+    "ts_epoch", "ts_iso", "event", "ts_suspicious", "path", "rel_path", "name", "size_bytes", "is_symlink",
+)
 
 
 @dataclass(frozen=True)
 class EventSpec:
-    field: str       # inventory 열 이름 (예: "mtime_epoch")
-    label: str       # 타임라인 이벤트 라벨 (예: "Modified")
+    """인벤토리 시간 열 하나를 타임라인 사건 하나로 바꾸는 규칙.
+
+    Attributes:
+        field: 인벤토리 열 이름(예: ``mtime_epoch``).
+        label: 타임라인 사건 이름(예: ``Modified``).
+    """
+
+    field: str
+    label: str
 
 
 DEFAULT_EVENTS: Tuple[EventSpec, ...] = (
-    EventSpec("birthtime_epoch", "Created"),          # macOS/일부 FS만 제공 (Windows는 ctime==create)
-    EventSpec("ctime_epoch",      "MetadataChanged"), # Windows에선 사실상 Created 역할, POSIX에선 i-node metadata
-    EventSpec("mtime_epoch",      "Modified"),
-    EventSpec("atime_epoch",      "Accessed"),
+    EventSpec("birthtime_epoch", "Created"),
+    EventSpec("ctime_epoch", "MetadataChanged"),
+    EventSpec("mtime_epoch", "Modified"),
+    EventSpec("atime_epoch", "Accessed"),
 )
 
 
 def build_timeline_rows(
-    rows: List[Dict[str, Union[str, int, float, bool, None]]],
+    rows: List[Dict[str, Value]],
     *,
     events: Tuple[EventSpec, ...] = DEFAULT_EVENTS,
     tz_offset_minutes: Optional[int] = None,
-    drop_na: bool = True,
-    emit_inventory_fields: Tuple[str, ...] = ("path", "name", "parent", "size_bytes", "is_symlink"),
-    iso_with_tz: bool = True,
-) -> List[Dict[str, Union[str, int, float, bool]]]:
-    """
-    인벤토리 rows(list[dict])를 '타임라인 이벤트 행'으로 펼쳐서 정렬해 반환.
-    - 파일 1개 → 이벤트(생성/수정/접근 등)별로 최대 4행 생성
-    - 각 행 컬럼:
-        ts_epoch: float   (UTC epoch)
-        ts_iso:   str     (ISO 8601 문자열, 로컬/지정 오프셋 반영)
-        event:    str     ("Created" / "MetadataChanged" / "Modified" / "Accessed")
-        + emit_inventory_fields에서 고른 원본 필드들
-    - tz_offset_minutes:
-        · None → 시스템 로컬 타임존
-        · 0    → UTC
-        · 정수 → 해당 오프셋(분) 적용 (예: KST=+540)
-    - drop_na: 타임스탬프가 None/0/음수 등 유효하지 않으면 행을 생성하지 않음
-    """
-    tzinfo = _resolve_tzinfo(tz_offset_minutes)
-    out: List[Dict[str, Union[str, int, float, bool]]] = []
+    emit_inventory_fields: Tuple[str, ...] = ("path", "rel_path", "name", "size_bytes", "is_symlink"),
+) -> List[Dict[str, Value]]:
+    """인벤토리 행을 사건 행으로 펼쳐 시간순으로 정렬한다.
 
+    Args:
+        rows: ``collect_inventory`` 결과.
+        events: 사건으로 만들 시간 열과 라벨.
+        tz_offset_minutes: 표시 시간대(분). None이면 이 PC의 시간대, 0이면 UTC,
+            540이면 KST(UTC+9).
+        emit_inventory_fields: 사건 행에 함께 복사할 인벤토리 열.
+
+    Returns:
+        사건 행 리스트(시간 오름차순). 열은 ``TIMELINE_FIELDS``다.
+        시각 값이 비어 있거나 숫자가 아니면 그 사건은 만들지 않는다.
+
+    Raises:
+        ValueError: ``tz_offset_minutes``가 ±24시간 범위를 벗어날 때.
+
+    Example:
+        >>> build_timeline_rows([{"path": "a", "mtime_epoch": 0.0}], tz_offset_minutes=0)[0]["ts_iso"]
+        '1970-01-01T00:00:00+00:00'
+    """
+    tzinfo = resolve_tzinfo(tz_offset_minutes)
+    future_limit = time.time() + FUTURE_TOLERANCE_SEC
+    out: List[Dict[str, Value]] = []
     for row in rows:
         base = {k: row.get(k) for k in emit_inventory_fields}
         for spec in events:
-            val = row.get(spec.field)  # epoch float 기대
-            epoch = _to_epoch_float(val)
-
+            epoch = _to_epoch(row.get(spec.field))
             if epoch is None:
-                if drop_na:
-                    continue
-                else:
-                    epoch = 0.0
-
-            ts_iso = _epoch_to_iso(epoch, tzinfo=tzinfo, with_tz=iso_with_tz)
+                continue
             out.append({
                 **base,
                 "event": spec.label,
-                "ts_epoch": float(epoch),
-                "ts_iso": ts_iso,
+                "ts_epoch": epoch,
+                "ts_iso": _epoch_to_iso(epoch, tzinfo),
+                "ts_suspicious": epoch <= 0 or epoch > future_limit,
             })
-
-    # 시간 오름차순 정렬
-    out.sort(key=lambda r: (r.get("ts_epoch", 0.0), str(r.get("path", "")), str(r.get("event", ""))))
+    out.sort(key=lambda r: (float(r["ts_epoch"]), str(r.get("path", "")), str(r.get("event", ""))))
     return out
 
 
-def write_timeline_csv(
-    timeline_rows: List[Dict[str, Union[str, int, float, bool]]],
-    csv_path: Union[str, Path],
-) -> None:
-    """
-    build_timeline_rows 결과를 CSV로 저장 (UTF-8 with BOM; 엑셀 호환).
-    """
-    if not timeline_rows:
-        # 빈 파일도 헤더는 쓰자
-        fieldnames = ["ts_epoch", "ts_iso", "event", "path", "name", "parent", "size_bytes", "is_symlink"]
-    else:
-        # 키 집합을 합쳐서 안정적인 헤더를 만든다
-        keys: List[str] = []
-        seen = set()
-        for r in timeline_rows:
-            for k in r.keys():
-                if k not in seen:
-                    seen.add(k)
-                    keys.append(k)
-        # 표준 컬럼을 앞으로
-        preferred = ["ts_epoch", "ts_iso", "event", "path", "name", "parent", "size_bytes", "is_symlink"]
-        fieldnames = preferred + [k for k in keys if k not in preferred]
+def resolve_tzinfo(tz_offset_minutes: Optional[int]) -> timezone:
+    """분 단위 오프셋으로 시간대 객체를 만든다.
 
-    csv_path = Path(csv_path)
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    Args:
+        tz_offset_minutes: None이면 이 PC의 시간대, 정수면 고정 오프셋.
 
-    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(timeline_rows)
+    Returns:
+        ``datetime.timezone`` 또는 이 PC의 시간대 객체.
 
-
-#파일 내부 함수
-
-
-def _resolve_tzinfo(tz_offset_minutes: Optional[int]) -> timezone:
-    """
-    분 단위 오프셋으로 tzinfo를 만든다.
-    - None  → 시스템 로컬 타임존
-    - int   → 해당 오프셋의 고정 타임존
+    Raises:
+        ValueError: 오프셋이 -1439~1439분 범위를 벗어날 때.
     """
     if tz_offset_minutes is None:
-        # 시스템 로컬 타임존
         return datetime.now().astimezone().tzinfo or timezone.utc
+    if not -1439 <= int(tz_offset_minutes) <= 1439:
+        raise ValueError("시간대 오프셋은 -1439~1439분 사이여야 합니다")
     return timezone(timedelta(minutes=int(tz_offset_minutes)))
 
 
-def _to_epoch_float(v: object) -> Optional[float]:
+def _to_epoch(v: Value) -> Optional[float]:
+    """값을 epoch(float)로 바꾼다. 비어 있거나 숫자가 아니거나 NaN·무한대면 None.
+
+    Args:
+        v: 인벤토리 시간 값.
+
+    Returns:
+        epoch 초 또는 None.
+    """
+    if v is None or v == "" or isinstance(v, bool):
+        return None
     try:
-        f = float(v)  # None/"" 등은 예외
+        f = float(v)
     except (TypeError, ValueError):
         return None
-    # 0이나 음수 epoch은 비정상일 수 있어 drop_na==True면 제외
-    if f <= 0:
-        return None
-    return f
+    return f if math.isfinite(f) else None
 
 
-def _epoch_to_iso(epoch: float, *, tzinfo: timezone, with_tz: bool = True) -> str:
+def _epoch_to_iso(epoch: float, tzinfo: timezone) -> str:
+    """epoch를 지정 시간대의 ISO 8601 문자열로 바꾼다.
+
+    OS가 표현할 수 없는 시각(아주 먼 과거·미래)은 빈 문자열을 반환한다.
+
+    Args:
+        epoch: epoch 초.
+        tzinfo: 표시 시간대.
+
+    Returns:
+        예: ``2025-10-02T11:22:33+09:00``. 변환할 수 없으면 빈 문자열.
     """
-    epoch(UTC 기준)을 지정한 tzinfo 시각의 ISO 8601 문자열로 변환.
-    - with_tz=True면 오프셋 포함 (예: 2025-10-02T11:22:33+09:00)
-    """
-    dt = datetime.fromtimestamp(epoch, tz=timezone.utc).astimezone(tzinfo)
-    if with_tz:
-        return dt.isoformat(timespec="seconds")
-    # 오프셋을 숨기고 ISO만
-    return dt.replace(tzinfo=None).isoformat(timespec="seconds")
+    try:
+        dt = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=epoch)
+        return dt.astimezone(tzinfo).isoformat(timespec="seconds")
+    except (OverflowError, ValueError, OSError):
+        return ""

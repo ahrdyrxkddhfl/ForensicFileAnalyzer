@@ -1,0 +1,24 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install libmagic
+        run: sudo apt-get update && sudo apt-get install -y libmagic1
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Run tests (libmagic 사용·미사용 두 경로 모두 검사)
+        run: python -m pytest -q

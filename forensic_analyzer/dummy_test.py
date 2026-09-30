@@ -1,123 +1,136 @@
-# make_dummy_evidence.py
+# forensic_analyzer/dummy_test.py
+"""테스트용 더미 증거 폴더(ForensicTestData)를 만든다.
+
+기능별로 "잡아야 하는 사례"와 "잡으면 안 되는 사례"를 함께 넣는다.
+
+- 확장자 위장: PNG 내용인 ``.jpg``(잡아야 함), 무작위 바이트인 ``.txt``(잡아야 함),
+  텍스트 뒤에 무작위 데이터를 붙인 ``.txt``(잡아야 함), 정상 PNG·ZIP·텍스트(잡으면 안 됨)
+- 인코딩 검색: UTF-8, CP949(메모장 ANSI), UTF-16(메모장 유니코드) 한글 메모
+- 해시: 내용이 같은 두 파일, 0바이트 파일, 10MB 파일(조각 단위 해시)
+- 경로: 한글·특수문자 파일명, 깊은 폴더, 심볼릭 링크
+
+무작위 데이터는 고정 시드로 만들어, 다시 실행해도 파일 내용이 바이트 단위로 같다.
+그래서 이 스크립트를 다시 돌려도 git에 변경 사항이 생기지 않는다(수정 시각은 git이
+추적하지 않는다).
+
+Example:
+    $ python forensic_analyzer/dummy_test.py            # 저장소의 ForensicTestData 재생성
+    $ python forensic_analyzer/dummy_test.py /tmp/case  # 다른 위치에 생성
+"""
 from __future__ import annotations
-import os, io, sys, time, json, shutil, random, string, zipfile, pathlib
+
+import json
+import os
+import random
+import shutil
+import sys
+import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Dict, Optional
 
-BASE_DIR = Path(__file__).resolve().parent.parent 
-ROOT = BASE_DIR / "ForensicTestData" 
+BASE_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_ROOT = BASE_DIR / "ForensicTestData"
+SEED = 42
+FIXED_ZIP_TIME = (2025, 10, 4, 21, 0, 0)
 
-def ensure_clean_root(root: pathlib.Path):
-    if root.exists():
-        print(f"[i] Removing old: {root}")
-        shutil.rmtree(root)
-    root.mkdir(parents=True)
-    print(f"[+] Created root: {root}")
 
-def write(path: pathlib.Path, data: bytes):
+def write(path: Path, data: bytes) -> None:
+    """상위 폴더를 만들고 바이트를 파일로 쓴다.
+
+    Args:
+        path: 쓸 경로.
+        data: 내용.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(data)
+    path.write_bytes(data)
 
-def write_text(path: pathlib.Path, s: str):
-    write(path, s.encode("utf-8", errors="ignore"))
 
-def rand_bytes(n: int) -> bytes:
-    return os.urandom(n)
+def png_bytes() -> bytes:
+    """1x1 PNG의 최소 바이트열을 만든다(시그니처 검증용).
 
-def make_fixed_content() -> bytes:
-    # 동일 해시(중복 파일) 검증용 고정 콘텐츠
-    random.seed(42)
-    return ("DUPLICATE_CONTENT_" + ("x"*4096) + "_END").encode()
-
-def png_bytes(width=1, height=1) -> bytes:
-    # 미니멀한 1x1 PNG (시그니처 검증용)
-    # 실제 PNG 시그니처 + 최소 IHDR/IDAT/​IEND 블록. 단순함을 위해 매우 작은 샘플 사용.
-    return (b"\x89PNG\r\n\x1a\n"  # signature
-            b"\x00\x00\x00\rIHDR"
-            b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00"
-            b"\x1f\x15\xc4\x89"
-            b"\x00\x00\x00\x0AIDATx\x01\x01\x01\x00\xfe\xff\x00\x00\x00\x00\x00"
+    Returns:
+        PNG 시그니처로 시작하는 바이트열.
+    """
+    return (b"\x89PNG\r\n\x1a\n"
+            b"\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+            b"\x00\x00\x00\x0aIDATx\x01\x01\x01\x00\xfe\xff\x00\x00\x00\x00\x00"
             b"\x00\x00\x00\x00IEND\xaeB`\x82")
 
-def jpeg_like_corrupted() -> bytes:
-    # JPEG 마커 시작만 두고 뒤를 깨뜨려 손상파일처럼 만듦
-    return b"\xff\xd8\xff\xe0" + b"THIS_IS_CORRUPTED_NOT_A_REAL_JPEG"
 
-def big_file_chunks(total_mb=10, chunk_kb=256):
-    chunks = (total_mb * 1024) // chunk_kb
-    for _ in range(int(chunks)):
-        yield os.urandom(chunk_kb * 1024)
+def make_zip(path: Path, members: Dict[str, bytes]) -> None:
+    """수정 시각을 고정한 ZIP을 만든다(다시 만들어도 바이트가 같도록).
 
-def make_zip(zip_path: pathlib.Path, members: dict[str, bytes]):
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    Args:
+        path: 만들 ZIP 경로.
+        members: 압축 안 경로 → 내용.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for name, data in members.items():
-            zf.writestr(name, data)
+            zf.writestr(zipfile.ZipInfo(name, date_time=FIXED_ZIP_TIME), data)
 
-def set_mtime(path: pathlib.Path, dt: datetime):
+
+def set_mtime(path: Path, dt: datetime) -> None:
+    """파일의 접근·수정 시각을 바꾼다(타임라인 검증용).
+
+    Args:
+        path: 대상 파일.
+        dt: 설정할 시각.
+    """
     ts = dt.timestamp()
-    os.utime(path, (ts, ts))  # atime, mtime (Windows에서 ctime은 별도)
+    os.utime(path, (ts, ts))
 
-def main():
-    ensure_clean_root(ROOT)
 
-    # 디렉터리 구성
-    docs = ROOT / "docs"
-    images = ROOT / "images"
-    bins = ROOT / "binaries"
-    logs = ROOT / "logs"
-    nested = ROOT / "nested"
-    weird = ROOT / "weird names !@#$%^&()[]{};',"  # 특수문자 경로
-    unicode_dir = ROOT / "유니코드_폴더"
+def generate(root: Path = DEFAULT_ROOT) -> Path:
+    """더미 증거 폴더를 새로 만든다. 기존 폴더는 지운다.
 
-    # 중복 파일(해시는 같고 이름/경로만 다른 케이스)
-    dup_content = make_fixed_content()
-    write(docs / "report_v1.txt", dup_content)
-    write(docs / "copies" / "report_copy.txt", dup_content)
+    Args:
+        root: 만들 폴더 경로.
 
-    # 0바이트 파일
+    Returns:
+        만든 폴더 경로.
+    """
+    rng = random.Random(SEED)
+    if root.exists():
+        shutil.rmtree(root)
+    root.mkdir(parents=True)
+
+    docs, images, bins = root / "docs", root / "images", root / "binaries"
+
+    # 해시: 내용이 같은 두 파일 / 0바이트 / 10MB
+    dup = b"DUPLICATE_CONTENT_" + b"x" * 4096 + b"_END"
+    write(docs / "report_v1.txt", dup)
+    write(docs / "copies" / "report_copy.txt", dup)
     write(bins / "empty.bin", b"")
+    write(bins / "big_random_10MB.bin", rng.randbytes(10 * 1024 * 1024))
 
-    # 대형 파일 (~10MB)
-    big = bins / "big_random_10MB.bin"
-    big.parent.mkdir(parents=True, exist_ok=True)
-    with open(big, "wb") as f:
-        for chunk in big_file_chunks(total_mb=10, chunk_kb=256):
-            f.write(chunk)
+    # 확장자 위장: 잡아야 하는 사례
+    write(images / "mismatch_signature.jpg", png_bytes())                    # 내용은 PNG
+    write(docs / "secret.txt", rng.randbytes(4096))                          # 텍스트 아님(암호화 흉내)
+    write(docs / "meeting_notes.txt",                                         # 텍스트 뒤에 데이터 은닉
+          ("회의록\n" + "안건 검토 및 일정 공유\n" * 1500).encode("utf-8") + rng.randbytes(12000))
 
-    # 시그니처/확장자 불일치
-    # PNG 시그니처이지만 확장자를 .jpg 로
-    write(images / "mismatch_signature.jpg", png_bytes())
-    # 진짜 PNG
+    # 확장자 위장: 잡으면 안 되는 사례
     write(images / "true_image.png", png_bytes())
+    write(images / "corrupted_photo.jpg", b"\xff\xd8\xff\xe0" + b"THIS_IS_CORRUPTED_NOT_A_REAL_JPEG")
+    make_zip(bins / "archive.zip", {"inner/readme.txt": b"This is inside zip\n",
+                                    "inner/data.bin": rng.randbytes(2048)})
 
-    # 손상 이미지 (JPEG처럼 보이긴 하는데 깨진다ㅇ)
-    write(images / "corrupted_photo.jpg", jpeg_like_corrupted())
+    # 텍스트·인코딩
+    write(docs / "notes.txt", b"hello\nthis is a note\n")
+    write(docs / "table.csv", b"id,value\n1,10\n2,20\n3,30\n")
+    write(docs / "meta.json", json.dumps({"case_id": 123, "owner": "alice"}, indent=2).encode())
+    write(root / "logs" / "app.log", b"[2025-10-04 21:00:00] INFO start\n[2025-10-04 21:01:00] ERROR oops\n")
+    write(docs / "memo_cp949.txt", "업무 메모\n비밀번호 변경 요청\n".encode("cp949"))   # 메모장 ANSI
+    write(docs / "memo_utf16.txt", "업무 메모\n비밀번호 초기화\n".encode("utf-16"))    # 메모장 유니코드
 
-    # 일반 텍스트/CSV/JSON/로그
-    write_text(docs / "notes.txt", "hello\nthis is a note\n")
-    write_text(docs / "table.csv", "id,value\n1,10\n2,20\n3,30\n")
-    write_text(docs / "meta.json", json.dumps({"case_id": 123, "owner": "alice"}, ensure_ascii=False, indent=2))
-    write_text(logs / "app.log", "[2025-10-04 21:00:00] INFO start\n[2025-10-04 21:01:00] ERROR oops\n")
+    # 경로: 한글·특수문자 이름, 깊은 폴더
+    write(root / "유니코드_폴더" / "증거_파일_01.txt", b"UTF-8 content\n")
+    write(root / "weird names !@#$%^&()[]{};'," / "strange file (final) [v3].txt", b"odd name\n")
+    write(root / "nested" / "deep_note.txt", b"very deep\n")
 
-    # 한글 인코딩 검색 검증용 (UTF-8이 아닌 한글 문서)
-    write(docs / "memo_cp949.txt", "업무 메모\n비밀번호 변경 요청\n".encode("cp949"))   # 메모장 ANSI 저장
-    write(docs / "memo_utf16.txt", "업무 메모\n비밀번호 초기화\n".encode("utf-16"))    # 메모장 유니코드 저장
-
-    # 확장자 위장 검증용: 텍스트 확장자인데 내용은 무작위 바이트(암호화 파일 은닉 흉내)
-    write(docs / "secret.txt", rand_bytes(4096))
-
-    # 압축파일
-    make_zip(bins / "archive.zip", {
-        "inner/readme.txt": b"This is inside zip\n",
-        "inner/data.bin": os.urandom(2048),
-    })
-
-    # 유니코드/특수문자 파일명
-    write(unicode_dir / "증거_파일_01.txt", b"UTF-8 content\n")
-    write(weird / "strange file (final) [v3].txt", b"odd name\n")
-
-    # 타임스탬프 다양화 (mtime만 파이썬으로 조정)
+    # 타임라인용 수정 시각
     now = datetime.now()
     set_mtime(docs / "report_v1.txt", now - timedelta(days=3))
     set_mtime(docs / "copies" / "report_copy.txt", now - timedelta(days=2, hours=5))
@@ -125,30 +138,37 @@ def main():
     set_mtime(images / "mismatch_signature.jpg", now - timedelta(hours=1))
     set_mtime(images / "corrupted_photo.jpg", now - timedelta(minutes=5))
 
-    # 깊은 중첩 경로
-    write(nested / "deep_note.txt", b"very deep\n")
-
-    # 심볼릭 링크(추후 확장 다시) 관리자 권한/개발자 모드 필요
+    # 심볼릭 링크(상대 경로라 저장소를 옮겨도 유지됨). Windows는 관리자/개발자 모드 필요.
+    link = root / "symlinks" / "link_to_report.txt"
+    link.parent.mkdir(parents=True, exist_ok=True)
     try:
-        target = docs / "report_v1.txt"
-        linkpath = ROOT / "symlinks" / "link_to_report.txt"
-        linkpath.parent.mkdir(parents=True, exist_ok=True)
-        os.symlink(target, linkpath)  # Windows: 관리자/Dev Mode 필요
+        os.symlink(os.path.join("..", "docs", "report_v1.txt"), link)
         print("[+] Created symlink")
-    except Exception as e:
+    except (OSError, NotImplementedError) as e:
         print(f"[!] Symlink skipped: {e}")
 
-    # 대체 데이터 스트림(ADS, NTFS 전용·Windows에서만)
+    # NTFS 대체 데이터 스트림(Windows 전용)
     if os.name == "nt":
-        ads_target = (docs / "notes.txt").as_posix() + ":secret"
         try:
-            with open(ads_target, "wb") as f:
+            with open(str(docs / "notes.txt") + ":secret", "wb") as f:
                 f.write(b"Hidden ADS content\n")
             print("[+] Created ADS on notes.txt")
-        except Exception as e:
+        except OSError as e:
             print(f"[!] ADS skipped: {e}")
 
-    print("\n[+] Done. Root:", ROOT)
+    print(f"[+] Done. Root: {root}")
+    return root
+
+
+def main(argv: Optional[list] = None) -> None:
+    """명령줄 진입점. 인자로 경로를 주면 그 위치에 만든다.
+
+    Args:
+        argv: 명령줄 인자(테스트용). None이면 ``sys.argv[1:]``.
+    """
+    argv = sys.argv[1:] if argv is None else argv
+    generate(Path(argv[0]) if argv else DEFAULT_ROOT)
+
 
 if __name__ == "__main__":
     main()

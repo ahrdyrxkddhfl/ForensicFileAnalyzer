@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# 테스트 캐시
+.pytest_cache/
+
 # 가상환경
 .venv/
 env/
@@ -12,8 +15,9 @@ venv/
 .DS_Store
 Thumbs.db
 
-# 실행 결과물
-outputs/*.csv
+# 실행 결과물 (폴더는 유지)
+outputs/*
+!outputs/.gitkeep
 
 # IDE/에디터 관련
 .vscode/

@@ -1,25 +1,69 @@
 # forensic_analyzer/search.py
+"""텍스트 파일 키워드·정규식 검색.
+
+대상 파일은 ``inventory.iter_files``로 고르므로, 인벤토리와 같은 제외 규칙과 심볼릭
+링크 정책을 따른다. 검색하지 못한 파일은 이유와 함께 따로 기록한다. 포렌식에서는
+"검색했는데 없음"과 "검색하지 못함"을 구분해야 하기 때문이다.
+
+인코딩 처리 순서:
+    1. BOM이 있으면 BOM이 가리키는 인코딩(UTF-8/16/32)
+    2. 사용자가 지정한 인코딩 목록(기본: UTF-8 → CP949)을 엄격 모드로 시도
+    3. BOM 없는 UTF-16(``textutil.detect_utf16_without_bom``)
+    4. 그래도 안 되면(예: 텍스트 뒤에 바이너리가 붙은 위장 파일) 2번 목록 중
+       파일 앞에서부터 가장 멀리까지 정상 디코딩되는 인코딩을 고르고(비슷하면 목록
+       앞쪽 우선), 깨진 부분만 대체 문자(U+FFFD)로 바꿔 읽는다.
+       ``encoding`` 열에 ``utf-8+replace``처럼 기록된다. 의심 파일일수록 텍스트 부분을
+       검색할 수 있어야 하기 때문이다. UTF-8 대체 모드는 ASCII 바이트를 그대로 두므로,
+       파일 대부분이 바이너리여도 영문·숫자 키워드는 찾을 수 있다.
+
+    기본 목록이 한국어 위주이므로, 일본어·중국어 문서는 ``--encodings utf-8 shift_jis``
+    처럼 직접 지정해야 정확하다. GBK 중국어 문서는 CP949로도 디코딩되어 버리는 경우가
+    있어 자동 판별로는 구분할 수 없다.
+"""
 from __future__ import annotations
-import csv
-import fnmatch
+
 import os
 import re
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
-# API 호출 부분
+from . import textutil
+from .inventory import iter_files
 
-def is_text_path(
-    path: Union[str, Path],
-    include_exts: Sequence[str] = ("txt", "log", "csv", "json", "xml", "md", "ini", "conf"),
-) -> bool:
+DEFAULT_ENCODINGS: Tuple[str, ...] = ("utf-8", "cp949")
+DEFAULT_INCLUDE_EXTS: Tuple[str, ...] = ("txt", "log", "csv", "json", "xml", "md", "ini", "conf", "reg")
+DEFAULT_MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+
+HIT_FIELDS: Tuple[str, ...] = (
+    "path", "line_no", "match_span_start", "match_span_end", "matched", "pattern", "encoding", "line_preview",
+)
+SKIP_FIELDS: Tuple[str, ...] = ("path", "reason", "size_bytes")
+
+
+def compile_patterns(
+    keywords: Sequence[str],
+    *,
+    use_regex: bool = False,
+    case_sensitive: bool = False,
+) -> List["re.Pattern[str]"]:
+    """검색어를 정규식 객체로 바꾼다.
+
+    검색을 시작하기 전에 호출해, 잘못된 정규식을 파일을 다 읽은 뒤가 아니라
+    처음에 오류로 알린다.
+
+    Args:
+        keywords: 검색어 목록.
+        use_regex: True면 검색어를 정규식으로, False면 문자 그대로 찾는다.
+        case_sensitive: 대소문자 구분 여부.
+
+    Returns:
+        컴파일된 패턴 목록.
+
+    Raises:
+        re.error: 정규식 문법이 잘못됐을 때.
     """
-    경량 텍스트 파일 후보를 확장자 기반으로 판정.
-    - include_exts: 'txt'처럼 점(.) 없는 소문자 확장자 목록
-    """
-    p = Path(path)
-    ext = p.suffix.lower().lstrip(".")
-    return ext in {e.lower().lstrip(".") for e in include_exts}
+    flags = 0 if case_sensitive else re.IGNORECASE
+    return [re.compile(kw if use_regex else re.escape(kw), flags) for kw in keywords]
 
 
 def search_texts(
@@ -28,215 +72,112 @@ def search_texts(
     *,
     use_regex: bool = False,
     case_sensitive: bool = False,
-    include_exts: Sequence[str] = ("txt", "log", "csv", "json", "xml", "md", "ini", "conf"),
+    include_exts: Sequence[str] = DEFAULT_INCLUDE_EXTS,
     exclude_globs: Optional[Iterable[str]] = None,
     follow_symlinks: bool = False,
-    max_file_size_bytes: int = 10 * 1024 * 1024,  # 10MB
-    encodings: Sequence[str] = ("utf-8", "cp949", "latin-1"),
+    max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE,
+    encodings: Sequence[str] = DEFAULT_ENCODINGS,
     preview_max_len: int = 240,
+    skipped: Optional[List[Dict[str, object]]] = None,
 ) -> List[Dict[str, Union[str, int]]]:
-    """
-    루트 폴더 아래 '경량 텍스트' 파일들을 라인 단위로 스캔하여 키워드(또는 정규식) 검색.
-    반환: 행 딕셔너리 리스트
-    - path: 파일 경로
-    - line_no: 매칭된 라인 번호(1부터 시작)
-    - match_span_start: 매칭 시작 인덱스
-    - match_span_end: 매칭 끝 인덱스
-    - line_preview: 매칭 라인의 미리보기(개행 제거, 길이 제한)
-    - matched: 실제 매칭된 텍스트(정규식 사용 시 그룹 전체)
-    - pattern: 검색 패턴(또는 키워드)
-    - encoding: 파일을 디코딩할 때 실제로 사용한 인코딩(예: utf-8, cp949)
-    """
-    root = Path(root).resolve()
-    _ex_patterns = tuple(exclude_globs or [])
+    """텍스트 파일들을 줄 단위로 읽으며 검색어를 찾는다.
 
+    한 줄에 같은 검색어가 여러 번 나오면 각각 한 건으로 기록한다.
+
+    Args:
+        root: 검색할 루트 폴더.
+        keywords: 검색어 목록.
+        use_regex: 검색어를 정규식으로 처리할지 여부.
+        case_sensitive: 대소문자 구분 여부.
+        include_exts: 검색 대상 확장자(점 없이, 예: ``"txt"``).
+        exclude_globs: 제외할 글롭 패턴.
+        follow_symlinks: 심볼릭 링크를 따라갈지 여부. False면 링크는 건너뛰고 기록한다.
+        max_file_size_bytes: 이보다 큰 파일은 건너뛰고 기록한다.
+        encodings: BOM이 없을 때 시도할 인코딩 목록. 모듈 설명 참고.
+        preview_max_len: 미리보기 최대 길이.
+        skipped: 검색하지 못한 파일을 ``{"path", "reason", "size_bytes"}``로 기록할
+            리스트. 이유는 ``symlink`` / ``too_large`` / ``read_error`` /
+            ``dir_read_error`` 중 하나다.
+
+    Returns:
+        검색 결과 행 리스트. 열은 ``HIT_FIELDS``다.
+
+    Raises:
+        re.error: 정규식 문법이 잘못됐을 때.
+
+    Example:
+        >>> hits = search_texts("ForensicTestData", ["비밀번호"])
+        >>> sorted({h["encoding"] for h in hits})  # doctest: +SKIP
+        ['cp949', 'utf-16']
+    """
     if not keywords:
         return []
-
+    patterns = compile_patterns(keywords, use_regex=use_regex, case_sensitive=case_sensitive)
+    wanted = {e.lower().lstrip(".") for e in include_exts}
+    dir_errors: List[Dict[str, str]] = []
     rows: List[Dict[str, Union[str, int]]] = []
-    patterns = _compile_patterns(
-        keywords,
-        use_regex=use_regex,
-        case_sensitive=case_sensitive,
-    )
 
-    for fpath in _iter_files(
-        root,
-        follow_symlinks=follow_symlinks,
-        exclude_globs=_ex_patterns,
-        include_exts=tuple(include_exts),
+    for fpath, is_link in iter_files(
+        Path(root).resolve(), follow_symlinks=follow_symlinks, exclude_globs=exclude_globs, errors=dir_errors
     ):
-        # 크기 상한
+        if fpath.suffix.lower().lstrip(".") not in wanted:
+            continue
+        if is_link and not follow_symlinks:
+            _skip(skipped, fpath, "symlink", "")
+            continue
         try:
-            st = fpath.stat() if follow_symlinks else os.lstat(fpath)
-            if st.st_size > max_file_size_bytes:
-                continue
-        except (OSError, PermissionError):
+            size = os.stat(fpath).st_size
+        except OSError:
+            _skip(skipped, fpath, "read_error", "")
+            continue
+        if size > max_file_size_bytes:
+            _skip(skipped, fpath, "too_large", size)
             continue
 
-        # 인코딩 판별: UTF-8 → CP949 → latin-1 순서로 파일 전체를 디코딩
-        decoded = _open_text_lines(fpath, encodings=encodings)
+        decoded = decode_text_file(fpath, encodings=encodings)
         if decoded is None:
+            _skip(skipped, fpath, "read_error", size)
             continue
         lines, used_encoding = decoded
 
         for lineno, line in enumerate(lines, start=1):
-            # 개행 제거(미리보기 안정화)
             display_line = line.rstrip("\r\n")
             for pat in patterns:
-                m = pat.search(line)
-                if not m:
-                    continue
-                start, end = m.span()
-                snippet = _shrink(display_line, start, end, max_len=preview_max_len)
-                rows.append({
-                    "path": str(fpath),
-                    "line_no": lineno,
-                    "match_span_start": start,
-                    "match_span_end": end,
-                    "line_preview": snippet,
-                    "matched": m.group(0),
-                    "pattern": pat.pattern,
-                    "encoding": used_encoding,
-                })
+                for m in pat.finditer(display_line):
+                    if m.start() == m.end():
+                        continue  # 빈 문자열 일치(예: 정규식 "^")는 의미가 없어 제외
+                    rows.append({
+                        "path": str(fpath),
+                        "line_no": lineno,
+                        "match_span_start": m.start(),
+                        "match_span_end": m.end(),
+                        "matched": m.group(0),
+                        "pattern": pat.pattern,
+                        "encoding": used_encoding,
+                        "line_preview": _shrink(display_line, m.start(), m.end(), max_len=preview_max_len),
+                    })
 
+    if skipped is not None:
+        for e in dir_errors:
+            skipped.append({"path": e["path"], "reason": "dir_read_error", "size_bytes": ""})
     return rows
 
 
-def write_hits_csv(
-    rows: List[Dict[str, Union[str, int]]],
-    csv_path: Union[str, Path],
-) -> None:
-    """
-    search_texts 결과(rows)를 CSV로 저장.
-    - UTF-8 with BOM으로 저장하여 엑셀 호환성 확보
-    """
-    csv_path = Path(csv_path)
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
+def decode_text_file(path: Path, *, encodings: Sequence[str] = DEFAULT_ENCODINGS) -> Optional[Tuple[List[str], str]]:
+    """파일 전체를 디코딩해 줄 목록과 실제로 사용한 인코딩을 반환한다.
 
-    fieldnames = [
-        "path",
-        "line_no",
-        "match_span_start",
-        "match_span_end",
-        "matched",
-        "pattern",
-        "encoding",
-        "line_preview",
-    ]
-
-    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-# 모듈 내부 함수 부분
-
-def _iter_files(
-    root: Path,
-    *,
-    follow_symlinks: bool,
-    exclude_globs: Tuple[str, ...],
-    include_exts: Tuple[str, ...],
-) -> Iterator[Path]:
-    """
-    os.scandir 기반 재귀 순회.
-    - exclude_globs와 매칭되면 디렉토리/파일 모두 스킵
-    - include_exts 확장자만 텍스트 후보로 취급
-    """
-    stack = [root]
-    while stack:
-        current = stack.pop()
-        try:
-            with os.scandir(current) as it:
-                for entry in it:
-                    p = Path(entry.path)
-                    # 제외 규칙
-                    if _is_excluded(p, exclude_globs):
-                        continue
-
-                    try:
-                        if entry.is_dir(follow_symlinks=follow_symlinks):
-                            stack.append(p)
-                        elif entry.is_file(follow_symlinks=follow_symlinks):
-                            if is_text_path(p, include_exts=include_exts):
-                                yield p
-                    except (OSError, PermissionError):
-                        continue
-        except (OSError, PermissionError):
-            continue
-
-
-def _is_excluded(path: Path, patterns: Tuple[str, ...]) -> bool:
-    if not patterns:
-        return False
-    spath = str(path)
-    name = path.name
-    for pat in patterns:
-        if fnmatch.fnmatch(spath, pat) or fnmatch.fnmatch(name, pat):
-            return True
-    return False
-
-
-def _compile_patterns(
-    keywords: Sequence[str],
-    *,
-    use_regex: bool,
-    case_sensitive: bool,
-) -> List[re.Pattern]:
-    flags = 0 if case_sensitive else re.IGNORECASE
-    patterns: List[re.Pattern] = []
-    for kw in keywords:
-        if use_regex:
-            patterns.append(re.compile(kw, flags))
-        else:
-            # literal 검색 -> 정규식 escape로 부분 일치
-            patterns.append(re.compile(re.escape(kw), flags))
-    return patterns
-
-
-# BOM으로 인코딩이 확정되는 경우. UTF-32 LE BOM(FF FE 00 00)은 UTF-16 LE BOM(FF FE)을
-# 포함하므로 반드시 먼저 검사한다.
-_BOM_ENCODINGS: Tuple[Tuple[bytes, str], ...] = (
-    (b"\xff\xfe\x00\x00", "utf-32"),
-    (b"\x00\x00\xfe\xff", "utf-32"),
-    (b"\xef\xbb\xbf", "utf-8-sig"),
-    (b"\xff\xfe", "utf-16"),
-    (b"\xfe\xff", "utf-16"),
-)
-
-
-def _open_text_lines(
-    path: Path,
-    *,
-    encodings: Sequence[str],
-) -> Optional[Tuple[List[str], str]]:
-    """파일 전체를 디코딩해 라인 목록과 실제로 사용한 인코딩을 반환한다.
-
-    파일을 텍스트 모드로 ``open``만 해서는 디코딩이 일어나지 않고, 실제로 읽는
-    순간 일어난다. 그래서 open 단계의 예외로는 다음 인코딩으로 넘어갈 수 없으므로
-    바이트를 먼저 전부 읽은 뒤 디코딩한다. 호출 측에서 파일 크기 상한을 걸고
-    있으므로 전체를 메모리에 올려도 된다.
-
-    디코딩 순서:
-        1. BOM이 있으면 BOM이 가리키는 인코딩(UTF-8/16/32)을 쓴다.
-           윈도우 메모장의 "유니코드" 저장, 레지스트리 내보내기(.reg)가 UTF-16이다.
-        2. BOM이 없으면 ``encodings``를 앞에서부터 시도한다.
-        3. 모두 실패하면 첫 인코딩을 ``errors="replace"``로 쓰고 ``+replace``를 붙인다.
-           기본값처럼 ``latin-1``이 목록에 있으면 latin-1은 모든 바이트를 디코딩하므로
-           3번까지 가지 않는다.
+    텍스트 모드로 ``open``만 해서는 디코딩이 일어나지 않고, 읽는 순간 일어난다.
+    그래서 바이트를 먼저 전부 읽은 뒤 디코딩한다(호출 측에서 크기 상한을 건다).
 
     Args:
-        path: 읽을 텍스트 파일 경로.
-        encodings: BOM이 없을 때 순서대로 시도할 인코딩 목록.
+        path: 읽을 파일 경로.
+        encodings: BOM이 없을 때 시도할 인코딩 목록.
 
     Returns:
-        ``(라인 리스트, 사용한 인코딩)`` 튜플. 파일을 읽지 못하면 None.
+        ``(줄 리스트, 인코딩 이름)``. 파일을 읽지 못하면 None.
 
     Example:
-        >>> lines, enc = _open_text_lines(Path("unicode_memo.txt"),
-        ...                               encodings=("utf-8", "cp949"))
+        >>> lines, enc = decode_text_file(Path("ForensicTestData/docs/memo_utf16.txt"))
         >>> enc
         'utf-16'
     """
@@ -245,12 +186,9 @@ def _open_text_lines(
     except OSError:
         return None
 
-    for bom, enc in _BOM_ENCODINGS:
-        if raw.startswith(bom):
-            try:
-                return raw.decode(enc).splitlines(keepends=True), enc
-            except UnicodeDecodeError:
-                break  # BOM만 흉내 낸 깨진 파일이면 일반 순서로 넘어간다.
+    bom = textutil.detect_bom_encoding(raw)
+    if bom:
+        return raw.decode(bom).splitlines(keepends=True), bom
 
     for enc in encodings:
         try:
@@ -258,25 +196,92 @@ def _open_text_lines(
         except (UnicodeDecodeError, LookupError):
             continue
 
-    fallback = encodings[0] if encodings else "utf-8"
-    return raw.decode(fallback, errors="replace").splitlines(keepends=True), f"{fallback}+replace"
+    utf16 = textutil.detect_utf16_without_bom(raw)
+    if utf16:
+        try:
+            return raw.decode(utf16).splitlines(keepends=True), utf16
+        except UnicodeDecodeError:
+            pass
+
+    enc = _pick_encoding_for_broken(raw, encodings)
+    return raw.decode(enc, errors="replace").splitlines(keepends=True), f"{enc}+replace"
+
+
+def _valid_prefix_len(raw: bytes, encoding: str) -> int:
+    """파일 앞에서부터 엄격 모드로 정상 디코딩되는 바이트 수를 구한다.
+
+    Args:
+        raw: 파일 바이트.
+        encoding: 인코딩 이름.
+
+    Returns:
+        처음으로 디코딩 오류가 나는 위치(바이트). 끝까지 되면 전체 길이. 모르는 인코딩이면 -1.
+    """
+    try:
+        raw.decode(encoding)
+        return len(raw)
+    except UnicodeDecodeError as e:
+        return e.start
+    except LookupError:
+        return -1
+
+
+def _pick_encoding_for_broken(raw: bytes, encodings: Sequence[str]) -> str:
+    """일부가 깨진 파일을 읽을 인코딩을 고른다.
+
+    "깨진 글자 수가 가장 적은 인코딩"으로 고르면 안 된다. CP949는 무작위 바이트 두 개를
+    한 글자로 묶어 받아들이는 경우가 많아, 바이너리 구간에서 깨진 글자가 오히려 적게
+    나오기 때문이다(그러면 앞부분의 UTF-8 한글이 CP949로 잘못 읽혀 검색되지 않는다).
+    그래서 파일 앞에서부터 **얼마나 멀리까지 정상적으로 읽히는지**를 기준으로 삼고,
+    가장 긴 것의 90% 이상이면 목록 앞쪽(사용자 우선순위)을 고른다.
+
+    Args:
+        raw: 파일 바이트.
+        encodings: 후보 인코딩(우선순위 순).
+
+    Returns:
+        고른 인코딩 이름. 후보가 모두 쓸 수 없으면 ``utf-8``.
+    """
+    lengths = [(enc, _valid_prefix_len(raw, enc)) for enc in encodings]
+    lengths = [(enc, n) for enc, n in lengths if n >= 0]
+    if not lengths:
+        return "utf-8"
+    longest = max(n for _, n in lengths)
+    for enc, n in lengths:
+        if n >= longest * 0.9:
+            return enc
+    return lengths[0][0]
+
+
+def _skip(skipped: Optional[List[Dict[str, object]]], path: Path, reason: str, size: object) -> None:
+    """검색하지 못한 파일을 기록한다.
+
+    Args:
+        skipped: 기록할 리스트. None이면 아무것도 하지 않는다.
+        path: 파일 경로.
+        reason: 건너뛴 이유.
+        size: 파일 크기(모르면 빈 문자열).
+    """
+    if skipped is not None:
+        skipped.append({"path": str(path), "reason": reason, "size_bytes": size})
 
 
 def _shrink(line: str, start: int, end: int, *, max_len: int = 240) -> str:
-    """
-    매칭 구간이 보이도록 앞/뒤를 적당히 축약한 미리보기 문자열 생성.
-    - 너무 긴 라인은 가독성 위해 앞뒤를 잘라 '…'로 표시
+    """긴 줄을 일치 구간이 가운데 오도록 잘라 미리보기를 만든다.
+
+    Args:
+        line: 원본 줄.
+        start: 일치 시작 위치.
+        end: 일치 끝 위치.
+        max_len: 미리보기 최대 길이.
+
+    Returns:
+        미리보기 문자열. 잘린 쪽에는 ``…``를 붙인다.
     """
     if len(line) <= max_len:
         return line
-
-    # match 중심으로 윈도우 구성
-    match_center = (start + end) // 2
-    half = max_len // 2
-    left = max(0, match_center - half)
+    center = (start + end) // 2
+    left = max(0, center - max_len // 2)
     right = min(len(line), left + max_len)
-
-    snippet = line[left:right]
-    prefix = "…" if left > 0 else ""
-    suffix = "…" if right < len(line) else ""
-    return f"{prefix}{snippet}{suffix}"
+    left = max(0, right - max_len)
+    return f"{'…' if left > 0 else ''}{line[left:right]}{'…' if right < len(line) else ''}"

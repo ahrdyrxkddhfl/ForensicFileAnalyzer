@@ -1,30 +1,39 @@
 # forensic_analyzer/signature.py
-"""파일 시그니처(매직 넘버) 기반 실제 파일 형식 판별 모듈.
+"""파일 시그니처(매직 넘버) 기반 실제 형식 판별과 확장자 위장 탐지.
 
-확장자가 아니라 파일 앞부분의 실제 바이트를 읽어 형식을 판별하고,
-디스크상 확장자와 비교해 위장 파일(예: .jpg로 이름만 바꾼 PNG)을 찾아낸다.
+확장자가 아니라 파일의 실제 바이트를 읽어 형식을 판별하고, 디스크상 확장자와
+비교해 위장 파일을 찾는다. 예를 들어 이름만 ``photo.jpg``이고 내용은 PNG인 파일,
+이름은 ``memo.txt``인데 내용은 텍스트가 아닌 파일을 찾아낸다.
 
 판별 순서:
-    1. python-magic(libmagic)이 설치되어 있으면 libmagic 결과를 사용한다.
-    2. 없거나 실패하면 이 모듈에 정의한 매직 넘버 표(_SIGNATURES)로 직접 판별한다.
-    3. 표에도 없으면 NUL 바이트 유무로 텍스트/바이너리만 구분한다.
+    1. python-magic(libmagic)이 설치되어 있으면 libmagic을 쓴다. libmagic이
+       ``application/octet-stream``(모름)으로 포기하면 2번으로 넘어간다.
+    2. 이 모듈의 매직 넘버 표(``SIGNATURES``)로 직접 판별한다.
+    3. 표에 없으면 텍스트인지 판별한다(``textutil.detect_text_encoding``).
+       BOM, UTF-8, CP949, Shift-JIS, GBK, CP1252, BOM 없는 UTF-16을 지원한다.
+    4. 모두 아니면 "알 수 없는 바이너리"다.
 
-어느 경우에도 확장자 기반 추측(mimetypes.guess_type)은 사용하지 않는다.
-확장자로 형식을 추측하면 확장자 위장을 절대 탐지할 수 없기 때문이다.
+어느 경우에도 확장자로 형식을 추측하지 않는다. 확장자로 추측하면 확장자 위장을
+탐지할 수 없기 때문이다.
+
+텍스트 파일 뒤에 숨긴 데이터:
+    판별은 파일 앞부분을 기준으로 하므로, 앞에 평범한 텍스트를 두고 뒤에 암호화
+    데이터를 붙이면 텍스트로 판정된다. 그래서 텍스트로 판정된 파일은 중간과 끝
+    구간도 표본으로 읽어, 텍스트가 아닌 구간이 있으면 ``embedded_binary``로 표시하고
+    텍스트 확장자라면 불일치로 판정한다.
 
 Example:
-    >>> rows = [{"path": "ForensicTestData/images/mismatch_signature.jpg"}]
-    >>> add_signature_to_rows(rows)[0]["ext_mismatch"]
-    True
+    >>> rows = add_signature_to_rows([{"path": "ForensicTestData/images/mismatch_signature.jpg"}])
+    >>> rows[0]["sig_mime"], rows[0]["ext_mismatch"]
+    ('image/png', True)
 """
 from __future__ import annotations
 
-import math
 import mimetypes
-import os  # noqa: F401  (독스트링 예제에서 os.urandom 사용)
-from collections import Counter
 from pathlib import Path
 from typing import Dict, FrozenSet, List, Optional, Tuple, Union
+
+from . import textutil
 
 try:
     import magic  # type: ignore
@@ -32,12 +41,14 @@ try:
 except Exception:  # ImportError, 또는 libmagic 공유 라이브러리 로드 실패(OSError)
     _HAS_MAGIC = False
 
+# 한 번에 읽는 표본 크기. 앞부분 판별과 중간·끝 구간 표본에 모두 쓴다.
+SAMPLE_BYTES = 8192
 
-# 헤더 판별에 읽을 바이트 수. 텍스트/바이너리 휴리스틱에도 같은 버퍼를 쓴다.
-_HEADER_READ_BYTES = 8192
+# OS의 mime.types 설정 파일을 읽지 않는 독립 인스턴스. PC마다 결과가 달라지지 않게 한다.
+_MIME_DB = mimetypes.MimeTypes()
 
-# (오프셋, 매직 바이트, MIME, 대표 확장자) 표. 긴 시그니처를 먼저 둬서 오판을 줄인다.
-_SIGNATURES: Tuple[Tuple[int, bytes, str, str], ...] = (
+# (오프셋, 매직 바이트, MIME, 대표 확장자). 긴 시그니처를 먼저 둬서 오판을 줄인다.
+SIGNATURES: Tuple[Tuple[int, bytes, str, str], ...] = (
     (0, b"\x89PNG\r\n\x1a\n", "image/png", ".png"),
     (0, b"SQLite format 3\x00", "application/vnd.sqlite3", ".sqlite"),
     (0, b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", "application/x-ole-storage", ".doc"),
@@ -47,123 +58,174 @@ _SIGNATURES: Tuple[Tuple[int, bytes, str, str], ...] = (
     (0, b"PK\x03\x04", "application/zip", ".zip"),
     (0, b"PK\x05\x06", "application/zip", ".zip"),  # 빈 ZIP
     (0, b"PK\x07\x08", "application/zip", ".zip"),  # 분할 ZIP
-    (0, b"bplist00", "application/x-bplist", ".plist"),  # iOS 바이너리 plist
+    (0, b"bplist00", "application/x-bplist", ".plist"),  # iOS·macOS 바이너리 plist
     (0, b"\xff\xd8\xff", "image/jpeg", ".jpg"),
     (0, b"\x1f\x8b", "application/gzip", ".gz"),
+    (0, b"7z\xbc\xaf\x27\x1c", "application/x-7z-compressed", ".7z"),
+    (0, b"Rar!\x1a\x07", "application/vnd.rar", ".rar"),
+    (0, b"\x7fELF", "application/x-executable", ""),          # 리눅스·안드로이드 실행 파일
+    (0, b"fLaC", "audio/flac", ".flac"),
+    (0, b"OggS", "audio/ogg", ".ogg"),
+    (0, b"ID3", "audio/mpeg", ".mp3"),
+    (0, b"II*\x00", "image/tiff", ".tiff"),
+    (0, b"MM\x00*", "image/tiff", ".tiff"),
 )
+# "MZ"(윈도우 실행 파일)와 "BM"(BMP)은 2바이트뿐이라, 우연히 그 글자로 시작하는 텍스트를
+# 오판할 수 있다. 그래서 표에 넣지 않고 ``_probe_bytes``에서 구조까지 확인한다.
+_BMP_DIB_SIZES = frozenset({12, 40, 52, 56, 64, 108, 124})
 
-# 내부 구조가 ZIP / OLE(복합 문서)인 형식 묶음. 한컴 HWP(5.x)는 OLE, HWPX는 ZIP이다.
-_ZIP_FAMILY: FrozenSet[str] = frozenset({
+# RIFF·ftyp 컨테이너는 오프셋 8의 형식 코드로 세부 형식을 가른다.
+RIFF_FORMS: Dict[bytes, Tuple[str, str]] = {
+    b"WEBP": ("image/webp", ".webp"), b"WAVE": ("audio/x-wav", ".wav"), b"AVI ": ("video/x-msvideo", ".avi"),
+}
+FTYP_BRANDS: Dict[bytes, Tuple[str, str]] = {
+    b"heic": ("image/heic", ".heic"), b"heix": ("image/heic", ".heic"), b"mif1": ("image/heic", ".heic"),
+    b"qt  ": ("video/quicktime", ".mov"), b"M4A ": ("audio/mp4", ".m4a"),
+}
+
+# 내용이 일반 텍스트인 확장자.
+TEXT_FAMILY: FrozenSet[str] = frozenset({
+    # 문서·데이터
+    ".txt", ".log", ".csv", ".tsv", ".json", ".xml", ".md", ".reg",
+    ".ini", ".conf", ".cfg", ".yaml", ".yml", ".toml", ".srt", ".vtt",
+    ".plist", ".svg", ".rtf", ".eml", ".vcf", ".ics", ".mbox", ".properties",  # XML plist·메일·연락처·일정
+    # 웹·스크립트·소스 코드
+    ".html", ".css", ".js", ".ts", ".py", ".sh", ".bat", ".ps1",
+    ".sql", ".java", ".kt", ".c", ".h", ".cpp", ".go", ".rs", ".rb", ".php",
+})
+
+# 내부 구조가 ZIP / OLE(복합 문서)인 형식. 한컴 HWP(5.x)는 OLE, HWPX는 ZIP이다.
+ZIP_FAMILY: FrozenSet[str] = frozenset({
     ".zip", ".docx", ".xlsx", ".pptx", ".docm", ".xlsm", ".pptm",
     ".odt", ".ods", ".odp", ".hwpx", ".epub", ".jar", ".apk", ".aar", ".ipa",
 })
-_OLE_FAMILY: FrozenSet[str] = frozenset({
+OLE_FAMILY: FrozenSet[str] = frozenset({
     ".doc", ".xls", ".ppt", ".msg", ".hwp", ".msi",
     ".db",  # Windows 썸네일 캐시 Thumbs.db는 OLE 형식이다.
 })
 
-# 같은 컨테이너 형식을 공유해서 "불일치"로 보면 안 되는 확장자 묶음.
-# 예: DOCX·XLSX·APK·IPA는 내부 구조가 전부 ZIP이다.
-_TEXT_FAMILY: FrozenSet[str] = frozenset({
-    # 문서·데이터
-    ".txt", ".log", ".csv", ".tsv", ".json", ".xml", ".md",
-    ".ini", ".conf", ".cfg", ".yaml", ".yml", ".toml", ".srt", ".vtt",
-    # 웹·스크립트·소스 코드(내용이 전부 일반 텍스트)
-    ".html", ".css", ".js", ".ts", ".py", ".sh", ".bat", ".ps1",
-    ".sql", ".java", ".kt", ".c", ".h", ".cpp", ".go", ".rs", ".rb", ".php",
-})
-_EXTRA_ALLOWED_EXTS: Dict[str, FrozenSet[str]] = {
-    "text/plain": _TEXT_FAMILY,
-    "application/zip": _ZIP_FAMILY,
+# 윈도우 PE(MZ로 시작하는 실행 파일) 계열 확장자.
+_PE_EXTS: FrozenSet[str] = frozenset({".exe", ".dll", ".sys", ".scr", ".ocx", ".cpl", ".com", ".efi", ".mui", ".drv"})
+
+# MIME별로 추가로 허용하는 확장자(같은 컨테이너 형식을 공유하는 경우).
+EXTRA_ALLOWED_EXTS: Dict[str, FrozenSet[str]] = {
+    "text/plain": TEXT_FAMILY,
+    "application/zip": ZIP_FAMILY,
     "application/vnd.sqlite3": frozenset({".sqlite", ".sqlite3", ".db"}),
     "application/x-sqlite3": frozenset({".sqlite", ".sqlite3", ".db"}),
-    "application/x-ole-storage": _OLE_FAMILY,
-    "application/cdfv2": _OLE_FAMILY,
-    "application/vnd.ms-office": _OLE_FAMILY,
+    "application/x-ole-storage": OLE_FAMILY,
+    "application/cdfv2": OLE_FAMILY,
+    "application/vnd.ms-office": OLE_FAMILY,
     "application/x-hwp": frozenset({".hwp"}),
+    "application/vnd.hancom.hwp": frozenset({".hwp"}),
+    "application/haansofthwp": frozenset({".hwp"}),
+    "application/hwp+zip": frozenset({".hwpx"}),
+    "application/vnd.hancom.hwpx": frozenset({".hwpx"}),
     "application/x-bplist": frozenset({".plist"}),
     "image/jpeg": frozenset({".jpg"}),
+    # libmagic이 내놓지만 Python 내장 MIME 표에는 확장자가 없는 형식들
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": frozenset({".docx", ".docm"}),
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": frozenset({".xlsx", ".xlsm"}),
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": frozenset({".pptx", ".pptm"}),
+    "application/vnd.oasis.opendocument.text": frozenset({".odt"}),
+    "application/vnd.oasis.opendocument.spreadsheet": frozenset({".ods"}),
+    "application/vnd.oasis.opendocument.presentation": frozenset({".odp"}),
+    "application/epub+zip": frozenset({".epub"}),
+    "application/java-archive": frozenset({".jar", ".apk", ".aar"}),
+    "application/vnd.android.package-archive": frozenset({".apk"}),
+    "application/x-dosexec": _PE_EXTS,
+    "application/vnd.microsoft.portable-executable": _PE_EXTS,
+    "application/x-7z-compressed": frozenset({".7z"}),
+    "application/vnd.rar": frozenset({".rar"}),
+    "application/x-rar": frozenset({".rar"}),
+    "application/x-executable": frozenset({".so", ".elf", ".bin", ".o"}),
+    "application/x-sharedlib": frozenset({".so", ".elf", ".bin"}),
+    "application/x-pie-executable": frozenset({".so", ".elf", ".bin"}),
+    "audio/mpeg": frozenset({".mp3"}),
+    "image/heic": frozenset({".heic", ".heif"}),
 }
 
-# 빈 파일. 내용이 없으므로 어떤 확장자와도 모순되지 않는다.
-_EMPTY_MIMES: FrozenSet[str] = frozenset({"inode/x-empty", "application/x-empty"})
-
-# 시그니처로 형식을 확정하지 못한 경우(알 수 없는 바이너리).
-_UNKNOWN_BINARY_MIMES: FrozenSet[str] = frozenset({"", "application/octet-stream"})
-
-# 정상 파일이라면 반드시 알려진 시그니처로 시작하는 확장자.
-# 이 확장자인데 시그니처가 없다면 헤더 훼손이나 위장을 의심한다. 예: 헤더가 지워진 photo.png
-_SIGNATURE_REQUIRED_EXTS: FrozenSet[str] = frozenset(
-    (_ZIP_FAMILY | _OLE_FAMILY | {".png", ".jpg", ".gif", ".pdf", ".sqlite", ".sqlite3", ".gz"})
-    - {".db"}  # .db는 SQLite 외에도 형식이 제각각이라 시그니처를 강제하지 않는다.
+# 정상이라면 반드시 알려진 시그니처로 시작하는 확장자.
+# .db는 SQLite 외에도 형식이 제각각이라 시그니처를 강제하지 않는다.
+SIGNATURE_REQUIRED_EXTS: FrozenSet[str] = frozenset(
+    (ZIP_FAMILY | OLE_FAMILY | {".png", ".jpg", ".gif", ".pdf", ".sqlite", ".sqlite3", ".gz",
+                                ".exe", ".dll", ".7z", ".rar", ".bmp", ".webp", ".wav", ".tiff", ".flac", ".ogg",
+                                ".heic"}) - {".db"}
 )
 
-# 텍스트 확장자인데 내용을 텍스트로 확정하지 못했을 때, 암호화·무작위 데이터로 볼 기준.
-# 섀넌 엔트로피(바이트당 비트, 최대 8)로 판단한다. 실측값 예시:
-#   UTF-8/latin-1/Shift-JIS/BOM 없는 UTF-16 텍스트, NUL로 채워진 로그 → 2.4 ~ 4.3
-#   무작위·암호화 데이터 → 7.9 이상
-# 표본이 너무 작으면 엔트로피가 낮게 나와 판단할 수 없으므로 최소 크기를 둔다.
-_HIGH_ENTROPY_BITS = 7.0
-_ENTROPY_MIN_BYTES = 256
+EMPTY_MIMES: FrozenSet[str] = frozenset({"inode/x-empty", "application/x-empty"})
+UNKNOWN_BINARY_MIMES: FrozenSet[str] = frozenset({"", "application/octet-stream"})
 
-_KNOWN_EXT_NORMALIZE = {
-    ".jpe": ".jpg",
-    ".jpeg": ".jpg",
-    ".tif": ".tiff",
-    ".htm": ".html",
-}
+# sig_source 값
+SOURCE_LIBMAGIC = "libmagic"
+SOURCE_HEADER = "header"
+SOURCE_TEXT = "text"
+SOURCE_UNKNOWN = "unknown"
+SOURCE_ERROR = "error"
+SOURCE_SYMLINK = "symlink"
+
+_KNOWN_EXT_NORMALIZE = {".jpe": ".jpg", ".jpeg": ".jpg", ".tif": ".tiff", ".htm": ".html"}
 
 
-def probe_file_type(
-    path: Union[str, Path],
-    *,
-    prefer_magic: bool = True,
-) -> Optional[Dict[str, str]]:
-    """파일의 실제 바이트를 읽어 MIME 형식과 설명을 판별한다.
+def probe_file_type(path: Union[str, Path], *, prefer_magic: bool = True) -> Optional[Dict[str, object]]:
+    """파일의 실제 바이트를 읽어 형식을 판별한다.
 
     Args:
         path: 판별할 파일 경로.
-        prefer_magic: True이고 python-magic이 설치되어 있으면 libmagic을 우선 사용한다.
-            False이면 항상 내장 매직 넘버 표로 판별한다.
+        prefer_magic: True이고 python-magic이 설치되어 있으면 libmagic을 우선 쓴다.
 
     Returns:
-        판별 결과 딕셔너리. 파일을 읽을 수 없으면 None.
+        판별 결과. 파일을 읽을 수 없으면 None(빈 파일과 구분하기 위해서다).
 
-        - ``real_mime`` (str): 판별된 MIME. 판별 불가 시 ``application/octet-stream``.
+        - ``real_mime`` (str): 판별된 MIME. 모르면 ``application/octet-stream``.
         - ``real_ext`` (str): MIME의 대표 확장자(예: ``.png``). 모르면 빈 문자열.
         - ``description`` (str): 사람이 읽을 수 있는 설명.
-        - ``source`` (str): 판별 근거. ``libmagic`` / ``header`` / ``heuristic``.
-        - ``high_entropy`` (str): 앞부분 엔트로피가 기준 이상이면 ``"1"``, 아니면 ``""``.
+        - ``source`` (str): 판별 근거(``libmagic``/``header``/``text``/``unknown``).
+        - ``high_entropy`` (bool): 표본 구간 중 압축·암호화 수준의 엔트로피가 있으면 True.
+          정상 ZIP·JPEG도 True이므로 이것만으로 의심 파일이라고 볼 수 없다.
+        - ``embedded_binary`` (bool): 앞부분은 텍스트인데 중간·끝 구간에 텍스트가
+          아닌 데이터가 있으면 True.
+        - ``small_sample`` (bool): 파일이 ``textutil.RELIABLE_TEXT_MIN_BYTES``보다 작아
+          텍스트 판별 신뢰도가 낮으면 True.
+        - ``fallback_mime`` / ``fallback_ext`` (str): 내장 판별(매직 넘버 표·텍스트 판별)
+          결과. libmagic이 허용 확장자를 알 수 없는 MIME을 내놓았을 때 판정에 쓴다.
 
     Example:
         >>> probe_file_type("ForensicTestData/images/mismatch_signature.jpg")["real_mime"]
         'image/png'
     """
-    path = Path(path)
-    if not path.is_file():
+    samples = _read_samples(path)
+    if samples is None:
         return None
+    head, others = samples
+    size_small = len(head) < textutil.RELIABLE_TEXT_MIN_BYTES and not others
 
-    head = _read_head(path)
-    high_entropy = "1" if _is_high_entropy(head) else ""
+    if not head:
+        return _result("inode/x-empty", "", "empty", SOURCE_HEADER)
 
+    result: Optional[Dict[str, object]] = None
     if prefer_magic and _HAS_MAGIC:
         try:
-            mime = magic.from_file(str(path), mime=True) or ""
+            mime = (magic.from_file(str(path), mime=True) or "").lower()
             desc = magic.from_file(str(path), mime=False) or ""
-            if mime and mime.lower() != "application/octet-stream":
-                return {
-                    "real_mime": mime,
-                    "real_ext": _ext_from_mime(mime),
-                    "description": desc,
-                    "source": "libmagic",
-                    "high_entropy": high_entropy,
-                }
+            if mime and mime not in UNKNOWN_BINARY_MIMES:
+                result = _result(mime, _ext_from_mime(mime), desc, SOURCE_LIBMAGIC)
         except Exception:
-            pass  # libmagic 오류 시 내장 판별로 넘어간다.
-        # libmagic이 octet-stream으로 포기한 경우에도 내장 표(BOM, HWP 등)로 한 번 더 확인한다.
+            result = None  # libmagic 오류 시 내장 판별로 넘어간다.
+    header = _probe_bytes(head)
+    if result is None:
+        result = header
+    # libmagic이 우리 표에 없는 MIME을 내놓으면 허용 확장자를 알 수 없다. 그때 판정에
+    # 쓸 수 있도록 내장 판별 결과를 함께 넘긴다.
+    result["fallback_mime"] = header["real_mime"]
+    result["fallback_ext"] = header["real_ext"]
 
-    result = _probe_header(head)
-    result["high_entropy"] = high_entropy
+    result["high_entropy"] = any(textutil.is_high_entropy(b) for b in (head, *others))
+    result["small_sample"] = size_small
+    if str(result["real_mime"]).startswith("text/"):
+        result["embedded_binary"] = any(
+            b.rstrip(b"\x00") and textutil.detect_text_encoding(b, partial=True) is None for b in others
+        )
     return result
 
 
@@ -171,212 +233,242 @@ def add_signature_to_rows(
     rows: List[Dict[str, object]],
     *,
     prefer_magic: bool = True,
+    follow_symlinks: bool = False,
     disk_ext_field: str = "ext_on_disk",
     sig_prefix: str = "sig_",
-    missing_as: str = "",
 ) -> List[Dict[str, object]]:
     """인벤토리 행마다 시그니처 판별 결과와 확장자 불일치 여부를 추가한다.
 
     Args:
-        rows: ``collect_inventory`` 결과. 각 행에 ``path`` 키가 있어야 한다.
-        prefer_magic: libmagic 우선 사용 여부. ``probe_file_type`` 참고.
+        rows: ``collect_inventory`` 결과. ``path``, ``is_symlink`` 열을 사용한다.
+        prefer_magic: libmagic 우선 사용 여부.
+        follow_symlinks: 인벤토리를 만들 때와 같은 값을 줘야 한다. False이면
+            심볼릭 링크는 판별하지 않는다(``sig_source=symlink``).
         disk_ext_field: 디스크상 확장자를 기록할 열 이름.
         sig_prefix: 추가할 시그니처 열의 접두어.
-        missing_as: 판별 실패 시 채울 값.
 
     Returns:
-        입력 ``rows``를 제자리에서 수정해 그대로 반환한다. 추가되는 열은 다음과 같다.
+        입력 ``rows``를 제자리에서 수정해 그대로 반환한다. 추가 열은 다음과 같다.
 
-        - ``{sig_prefix}mime``: 실제 MIME (예: ``image/png``)
-        - ``{sig_prefix}ext``: 시그니처 기준 대표 확장자 (예: ``.png``)
-        - ``{sig_prefix}desc``: 판별 설명
-        - ``{sig_prefix}source``: 판별 근거 (``libmagic`` / ``header`` / ``heuristic``)
-        - ``{sig_prefix}high_entropy``: 앞부분이 무작위·암호화 수준의 엔트로피이면 True
+        - ``{sig_prefix}mime`` / ``ext`` / ``desc``: 판별된 MIME, 대표 확장자, 설명
+        - ``{sig_prefix}source``: 판별 근거. 읽기 실패는 ``error``, 링크는 ``symlink``
+        - ``{sig_prefix}high_entropy``: 압축·암호화 수준 엔트로피 구간이 있음
+          (정상 ZIP·JPEG도 True)
         - ``{disk_ext_field}``: 디스크상 확장자
-        - ``ext_mismatch``: 확장자와 실제 형식이 다르면 True
-
-    Example:
-        >>> rows = add_signature_to_rows([{"path": "a.jpg"}])  # 실제로는 PNG인 파일
-        >>> rows[0]["sig_mime"], rows[0]["ext_mismatch"]
-        ('image/png', True)
+        - ``ext_mismatch``: 확장자와 실제 내용이 어긋나면 True
     """
     for row in rows:
         p = row.get("path")
         disk_ext = _disk_extension(str(p)) if p else ""
-        result = probe_file_type(p, prefer_magic=prefer_magic) if p else None
+        row[disk_ext_field] = disk_ext
 
-        row[disk_ext_field] = disk_ext or missing_as
+        if row.get("is_symlink") and not follow_symlinks:
+            _fill_blank(row, sig_prefix, SOURCE_SYMLINK, "심볼릭 링크(따라가지 않음)")
+            continue
+        result = probe_file_type(p, prefer_magic=prefer_magic) if p else None
         if result is None:
-            row[f"{sig_prefix}mime"] = missing_as
-            row[f"{sig_prefix}ext"] = missing_as
-            row[f"{sig_prefix}desc"] = missing_as
-            row[f"{sig_prefix}source"] = missing_as
-            row[f"{sig_prefix}high_entropy"] = False
-            row["ext_mismatch"] = False
+            _fill_blank(row, sig_prefix, SOURCE_ERROR, "파일을 읽을 수 없음")
             continue
 
-        row[f"{sig_prefix}mime"] = result["real_mime"] or missing_as
-        row[f"{sig_prefix}ext"] = result["real_ext"] or missing_as
-        row[f"{sig_prefix}desc"] = result["description"] or missing_as
+        row[f"{sig_prefix}mime"] = result["real_mime"]
+        row[f"{sig_prefix}ext"] = result["real_ext"]
+        row[f"{sig_prefix}desc"] = result["description"]
         row[f"{sig_prefix}source"] = result["source"]
-        row[f"{sig_prefix}high_entropy"] = bool(result.get("high_entropy"))
-        row["ext_mismatch"] = _is_ext_mismatch(
-            disk_ext, result["real_mime"], result["real_ext"],
-            high_entropy=bool(result.get("high_entropy")),
+        row[f"{sig_prefix}high_entropy"] = bool(result["high_entropy"])
+        row["ext_mismatch"] = is_ext_mismatch(
+            disk_ext,
+            str(result["real_mime"]),
+            str(result["real_ext"]),
+            embedded_binary=bool(result.get("embedded_binary")),
+            fallback_mime=str(result.get("fallback_mime") or ""),
+            fallback_ext=str(result.get("fallback_ext") or ""),
         )
+        if result.get("embedded_binary"):
+            row[f"{sig_prefix}desc"] = f"{result['description']} / 중간·끝 구간에 텍스트가 아닌 데이터"
     return rows
+
+
+def is_ext_mismatch(
+    disk_ext: str,
+    real_mime: str,
+    real_ext: str,
+    *,
+    embedded_binary: bool = False,
+    fallback_mime: str = "",
+    fallback_ext: str = "",
+) -> bool:
+    """디스크상 확장자가 실제 내용과 어긋나는지 판정한다.
+
+    판정 규칙:
+        - 빈 파일이면 False(내용이 없으니 어떤 확장자와도 모순되지 않는다).
+        - 실제 내용이 "알 수 없는 바이너리"일 때:
+            * .png·.pdf·.zip·.hwp처럼 시그니처가 있어야 하는 확장자면 True(헤더 훼손·위장).
+            * .txt·.log 같은 텍스트 확장자면 True. 지원하는 어떤 인코딩으로도 텍스트가
+              아니라는 뜻이다(암호화·바이너리 은닉).
+            * .bin·.dat처럼 원래 아무 바이너리나 담는 확장자면 False.
+        - 텍스트로 판정됐어도 텍스트 확장자인데 중간·끝 구간에 텍스트가 아닌 데이터가
+          있으면 True(텍스트 뒤에 데이터 은닉).
+        - 형식이 판별됐는데 확장자가 없으면, 텍스트는 False(README 등), 그 외는 True.
+        - 그 밖에는 허용 확장자 집합에 없으면 True. libmagic이 우리 표에 없는 MIME을
+          내놓아 허용 집합이 비면, 내장 판별 결과(``fallback_*``)의 허용 집합을 쓴다.
+          그래도 비면 판정할 수 없으므로 False.
+
+    Args:
+        disk_ext: 디스크상 확장자.
+        real_mime: 판별된 MIME.
+        real_ext: 판별된 대표 확장자.
+        embedded_binary: 텍스트 파일의 중간·끝 구간에 텍스트가 아닌 데이터가 있는지.
+        fallback_mime: 내장 판별 MIME(libmagic 결과를 해석할 수 없을 때 사용).
+        fallback_ext: 내장 판별 대표 확장자.
+
+    Returns:
+        불일치이면 True.
+
+    Example:
+        >>> is_ext_mismatch(".jpg", "image/png", ".png")
+        True
+        >>> is_ext_mismatch(".txt", "application/octet-stream", "")
+        True
+        >>> is_ext_mismatch(".bin", "application/octet-stream", "")
+        False
+        >>> is_ext_mismatch(".hwp", "application/x-ole-storage", ".doc")
+        False
+        >>> is_ext_mismatch(".jpg", "application/x-dosexec", ".exe")   # 사진으로 위장한 실행 파일
+        True
+    """
+    mime = (real_mime or "").lower()
+    d = _normalize_ext(disk_ext)
+
+    if mime in EMPTY_MIMES:
+        return False
+    if mime in UNKNOWN_BINARY_MIMES:
+        return d in SIGNATURE_REQUIRED_EXTS or d in TEXT_FAMILY
+    if mime.startswith("text/") and embedded_binary and d in TEXT_FAMILY:
+        return True
+
+    allowed = _allowed_exts(mime, real_ext)
+    if not allowed and fallback_mime and fallback_mime.lower() not in UNKNOWN_BINARY_MIMES | EMPTY_MIMES:
+        allowed = _allowed_exts(fallback_mime.lower(), fallback_ext)
+    if not allowed:
+        return False
+    if not d:
+        return not mime.startswith("text/")
+    return d not in allowed
 
 
 # ---------------------------------------------------------------------------
 # 내부 유틸
 # ---------------------------------------------------------------------------
 
-def _probe_header(head: bytes) -> Dict[str, str]:
-    """파일 앞부분 바이트만으로 형식을 판별한다(libmagic 미사용 경로).
+def _result(mime: str, ext: str, desc: str, source: str) -> Dict[str, object]:
+    """판별 결과 딕셔너리를 기본값과 함께 만든다.
 
     Args:
-        head: 파일 앞부분 바이트(최대 ``_HEADER_READ_BYTES``).
+        mime: MIME.
+        ext: 대표 확장자.
+        desc: 설명.
+        source: 판별 근거.
 
     Returns:
-        ``probe_file_type``과 같은 형태의 딕셔너리.
+        ``probe_file_type`` 반환 형식의 딕셔너리.
     """
-    if not head:
-        return {"real_mime": "inode/x-empty", "real_ext": "",
-                "description": "empty", "source": "header"}
+    return {"real_mime": mime, "real_ext": ext, "description": desc, "source": source,
+            "high_entropy": False, "embedded_binary": False, "small_sample": False,
+            "fallback_mime": "", "fallback_ext": ""}
 
-    if _is_bom_text(head):
-        return {"real_mime": "text/plain", "real_ext": ".txt",
-                "description": "text with BOM (UTF-8/16/32)", "source": "header"}
 
-    for offset, sig, mime, ext in _SIGNATURES:
+def _probe_bytes(head: bytes) -> Dict[str, object]:
+    """libmagic 없이 앞부분 바이트만으로 형식을 판별한다.
+
+    Args:
+        head: 파일 앞부분 바이트(비어 있지 않음).
+
+    Returns:
+        ``_result`` 형식의 딕셔너리.
+    """
+    if head[:4] == b"RIFF" and head[8:12] in RIFF_FORMS:
+        mime, ext = RIFF_FORMS[head[8:12]]
+        return _result(mime, ext, f"매직 넘버 일치(RIFF {head[8:12]!r})", SOURCE_HEADER)
+    if head[4:8] == b"ftyp":
+        mime, ext = FTYP_BRANDS.get(head[8:12], ("video/mp4", ".mp4"))
+        return _result(mime, ext, f"매직 넘버 일치(ftyp {head[8:12]!r})", SOURCE_HEADER)
+    for offset, sig, mime, ext in SIGNATURES:
         if head[offset:offset + len(sig)] == sig:
-            return {"real_mime": mime, "real_ext": ext,
-                    "description": f"magic number match ({sig[:8]!r})",
-                    "source": "header"}
+            return _result(mime, ext, f"매직 넘버 일치({sig[:8]!r})", SOURCE_HEADER)
+    if _is_pe(head):
+        return _result("application/x-dosexec", ".exe", "윈도우 실행 파일(MZ + PE 헤더)", SOURCE_HEADER)
+    if head[:2] == b"BM" and len(head) >= 18 and int.from_bytes(head[14:18], "little") in _BMP_DIB_SIZES:
+        return _result("image/bmp", ".bmp", "매직 넘버 일치(BM + DIB 헤더)", SOURCE_HEADER)
+    enc = textutil.detect_text_encoding(head)
+    if enc:
+        return _result("text/plain", ".txt", f"텍스트({enc})", SOURCE_TEXT)
+    if not head.rstrip(b"\x00"):
+        return _result("application/octet-stream", "", "NUL 바이트로만 채워짐", SOURCE_UNKNOWN)
+    return _result("application/octet-stream", "", "알 수 없는 바이너리", SOURCE_UNKNOWN)
 
-    if b"\x00" not in head and _decodes_as_text(head):
-        return {"real_mime": "text/plain", "real_ext": ".txt",
-                "description": "text (no NUL byte)", "source": "heuristic"}
 
-    return {"real_mime": "application/octet-stream", "real_ext": "",
-            "description": "unknown binary", "source": "heuristic"}
+def _is_pe(head: bytes) -> bool:
+    """윈도우 PE 실행 파일인지 확인한다.
 
-
-def _is_bom_text(head: bytes) -> bool:
-    """BOM으로 시작하고, 실제로 그 인코딩의 정상 텍스트인지 확인한다.
-
-    BOM 2~4바이트만 보고 텍스트로 인정하면, 무작위 바이트 앞에 ``FF FE``만 붙여
-    위장 판정을 피할 수 있다. 그래서 BOM이 가리키는 인코딩으로 실제 디코딩이
-    되는지, 엔트로피가 텍스트 수준인지까지 확인한다.
+    ``MZ``로 시작하고, 0x3C 위치의 4바이트 값(PE 헤더 위치)이 가리키는 곳에
+    ``PE\\0\\0``이 있어야 한다. EXE·DLL·SYS가 모두 이 구조다.
 
     Args:
         head: 파일 앞부분 바이트.
 
     Returns:
-        정상적인 BOM 텍스트이면 True.
+        PE 구조이면 True.
 
     Example:
-        >>> _is_bom_text("메모".encode("utf-16"))
-        True
-        >>> _is_bom_text(b"\\xff\\xfe" + os.urandom(4096))
+        >>> _is_pe(b"MZ is a city in text")
         False
     """
-    candidates = (
-        (b"\xff\xfe\x00\x00", "utf-32", 4),
-        (b"\x00\x00\xfe\xff", "utf-32", 4),
-        (b"\xef\xbb\xbf", "utf-8-sig", 1),
-        (b"\xff\xfe", "utf-16", 2),
-        (b"\xfe\xff", "utf-16", 2),
-    )
-    for bom, enc, unit in candidates:
-        if not head.startswith(bom):
-            continue
-        body = head[: len(head) - (len(head) % unit)]
-        # 읽기 버퍼 끝에서 문자가 잘렸을 수 있으므로 마지막 한 문자분은 잘라 가며 재시도한다.
-        for cut in (0, unit, unit * 2, 3):
-            try:
-                (body[:-cut] if cut else body).decode(enc)
-                break
-            except UnicodeDecodeError:
-                continue
-        else:
-            return False
-        return not _is_high_entropy(head)
-    return False
+    if head[:2] != b"MZ" or len(head) < 0x40:
+        return False
+    pe_offset = int.from_bytes(head[0x3C:0x40], "little")
+    return 0x40 <= pe_offset <= len(head) - 4 and head[pe_offset:pe_offset + 4] == b"PE\x00\x00"
 
 
-def _shannon_entropy(buf: bytes) -> float:
-    """바이트열의 섀넌 엔트로피(바이트당 비트, 0~8)를 계산한다.
-
-    값이 8에 가까울수록 바이트가 고르게 분포한다(무작위·암호화·압축 데이터).
-    사람이 읽는 텍스트는 쓰는 문자가 한정되어 있어 훨씬 낮다.
-
-    Args:
-        buf: 계산할 바이트열.
-
-    Returns:
-        엔트로피 값. 빈 입력이면 0.0.
-
-    Example:
-        >>> round(_shannon_entropy(b"aaaa"), 2)
-        0.0
-        >>> _shannon_entropy(os.urandom(4096)) > 7.9
-        True
-    """
-    if not buf:
-        return 0.0
-    n = len(buf)
-    return -sum(c / n * math.log2(c / n) for c in Counter(buf).values())
-
-
-def _is_high_entropy(buf: bytes) -> bool:
-    """표본이 충분히 크고 엔트로피가 기준 이상이면 True를 반환한다.
-
-    Args:
-        buf: 파일 앞부분 바이트.
-
-    Returns:
-        ``_ENTROPY_MIN_BYTES`` 이상이고 엔트로피가 ``_HIGH_ENTROPY_BITS`` 이상이면 True.
-    """
-    return len(buf) >= _ENTROPY_MIN_BYTES and _shannon_entropy(buf) >= _HIGH_ENTROPY_BITS
-
-
-def _read_head(path: Union[str, Path]) -> bytes:
-    """파일 앞부분을 ``_HEADER_READ_BYTES``만큼 읽는다. 실패하면 빈 바이트열.
+def _read_samples(path: Union[str, Path]) -> Optional[Tuple[bytes, Tuple[bytes, ...]]]:
+    """파일의 앞부분과, 파일이 크면 중간·끝 구간 표본을 읽는다.
 
     Args:
         path: 파일 경로.
 
     Returns:
-        읽은 바이트열.
+        ``(앞부분, (중간, 끝))``. 파일이 ``SAMPLE_BYTES``의 두 배 이하면 중간·끝은
+        생략한다(앞부분과 겹치므로). 읽기에 실패하면 None.
     """
     try:
         with Path(path).open("rb") as f:
-            return f.read(_HEADER_READ_BYTES)
+            head = f.read(SAMPLE_BYTES)
+            f.seek(0, 2)
+            size = f.tell()
+            others: List[bytes] = []
+            if size > SAMPLE_BYTES * 2:
+                for start in ((size - SAMPLE_BYTES) // 2, size - SAMPLE_BYTES):
+                    f.seek(start)
+                    others.append(f.read(SAMPLE_BYTES))
+            return head, tuple(others)
     except OSError:
-        return b""
+        return None
 
 
-def _decodes_as_text(buf: bytes) -> bool:
-    """버퍼가 UTF-8 또는 CP949 텍스트로 해석되는지 확인한다.
-
-    읽기 버퍼 끝에서 멀티바이트 문자가 잘릴 수 있으므로 마지막 3바이트까지는
-    잘라내며 재시도한다.
+def _fill_blank(row: Dict[str, object], sig_prefix: str, source: str, desc: str) -> None:
+    """판별하지 않은(또는 못 한) 행의 시그니처 열을 채운다.
 
     Args:
-        buf: 검사할 바이트열.
-
-    Returns:
-        두 인코딩 중 하나로 디코딩되면 True.
+        row: 인벤토리 행.
+        sig_prefix: 시그니처 열 접두어.
+        source: ``sig_source`` 값.
+        desc: ``sig_desc`` 값.
     """
-    for enc in ("utf-8", "cp949"):
-        for cut in range(4):
-            try:
-                (buf[:-cut] if cut else buf).decode(enc)
-                return True
-            except UnicodeDecodeError:
-                continue
-    return False
+    row[f"{sig_prefix}mime"] = ""
+    row[f"{sig_prefix}ext"] = ""
+    row[f"{sig_prefix}desc"] = desc
+    row[f"{sig_prefix}source"] = source
+    row[f"{sig_prefix}high_entropy"] = ""
+    row["ext_mismatch"] = False
 
 
 def _normalize_ext(ext: str) -> str:
@@ -403,103 +495,38 @@ def _disk_extension(path: str) -> str:
         path: 파일 경로.
 
     Returns:
-        정규화된 확장자. 확장자가 없으면 빈 문자열.
+        정규화된 확장자. 없으면 빈 문자열.
     """
     return _normalize_ext(Path(path).suffix)
 
 
 def _ext_from_mime(mime: str) -> str:
-    """MIME에서 대표 확장자를 추정한다.
+    """MIME에서 대표 확장자를 추정한다(OS 설정과 무관한 내장 표 사용).
 
     Args:
         mime: MIME 문자열.
 
     Returns:
-        정규화된 대표 확장자. 알 수 없으면 빈 문자열.
+        정규화된 대표 확장자. 모르면 빈 문자열.
     """
-    if not mime:
-        return ""
-    return _normalize_ext(mimetypes.guess_extension(mime) or "")
+    return _normalize_ext(_MIME_DB.guess_extension(mime) or "") if mime else ""
 
 
 def _allowed_exts(mime: str, real_ext: str) -> FrozenSet[str]:
     """해당 MIME으로 판별된 파일이 가져도 정상인 확장자 집합을 만든다.
 
     Args:
-        mime: 판별된 MIME.
+        mime: 판별된 MIME(소문자).
         real_ext: 판별된 대표 확장자.
 
     Returns:
         허용 확장자 집합. 비어 있으면 판정 불가를 뜻한다.
     """
-    mime = mime.lower()
-    allowed = {_normalize_ext(e) for e in mimetypes.guess_all_extensions(mime)}
+    allowed = {_normalize_ext(e) for e in _MIME_DB.guess_all_extensions(mime)}
     if real_ext:
         allowed.add(_normalize_ext(real_ext))
-    allowed |= _EXTRA_ALLOWED_EXTS.get(mime, frozenset())
+    allowed |= EXTRA_ALLOWED_EXTS.get(mime, frozenset())
     if mime.startswith("text/"):
-        allowed |= _TEXT_FAMILY  # text/csv, text/x-log 등 세부 판별 차이를 흡수
+        allowed |= TEXT_FAMILY  # text/csv, text/x-script.python 등 세부 판별 차이를 흡수
     allowed.discard("")
     return frozenset(allowed)
-
-
-def _is_ext_mismatch(
-    disk_ext: str,
-    real_mime: str,
-    real_ext: str,
-    *,
-    high_entropy: bool = False,
-) -> bool:
-    """디스크상 확장자가 실제 형식과 어긋나는지 판정한다.
-
-    판정 규칙:
-        - 빈 파일이면 False.
-        - 실제 형식이 "알 수 없는 바이너리"일 때:
-            * 확장자가 시그니처를 가져야 하는 형식(.png, .pdf, .zip, .hwp 등)이면 True.
-              헤더 훼손이나 위장을 의심한다.
-            * 확장자가 텍스트 계열이면, 엔트로피가 무작위·암호화 수준일 때만 True.
-              latin-1·Shift-JIS·BOM 없는 UTF-16 텍스트나 NUL로 채워진 로그처럼
-              내장 판별기가 텍스트로 확정하지 못한 정상 파일은 엔트로피가 낮아 False.
-            * 그 밖의 확장자(.bin, .dat 등)는 False.
-        - 형식이 판별됐는데 확장자가 없으면, 텍스트는 False(README 등), 그 외는 True.
-        - 그 밖에는 허용 확장자 집합에 없으면 True.
-
-    Args:
-        disk_ext: 디스크상 확장자.
-        real_mime: 판별된 MIME.
-        real_ext: 판별된 대표 확장자.
-        high_entropy: 파일 앞부분 엔트로피가 ``_HIGH_ENTROPY_BITS`` 이상인지 여부.
-
-    Returns:
-        불일치이면 True.
-
-    Example:
-        >>> _is_ext_mismatch(".jpg", "image/png", ".png")
-        True
-        >>> _is_ext_mismatch(".txt", "application/octet-stream", "", high_entropy=True)
-        True
-        >>> _is_ext_mismatch(".log", "application/octet-stream", "", high_entropy=False)
-        False
-        >>> _is_ext_mismatch(".png", "application/octet-stream", "")
-        True
-        >>> _is_ext_mismatch(".db", "application/x-ole-storage", ".doc")  # Thumbs.db
-        False
-    """
-    mime = (real_mime or "").lower()
-    d = _normalize_ext(disk_ext)
-
-    if mime in _EMPTY_MIMES:
-        return False
-    if mime in _UNKNOWN_BINARY_MIMES:
-        if d in _SIGNATURE_REQUIRED_EXTS:
-            return True
-        if d in _TEXT_FAMILY:
-            return high_entropy
-        return False
-
-    allowed = _allowed_exts(mime, real_ext)
-    if not allowed:
-        return False
-    if not d:
-        return not mime.startswith("text/")
-    return d not in allowed
