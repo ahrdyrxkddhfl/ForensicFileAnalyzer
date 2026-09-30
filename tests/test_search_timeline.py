@@ -49,13 +49,13 @@ def test_truncated_file_does_not_crash(write, tmp_path: Path, encoding: str) -> 
 def test_partially_broken_file_is_still_searched(write, tmp_path: Path, rng: random.Random) -> None:
     write("notes.txt", ("안건 검토\n" * 100).encode() + rng.randbytes(5000))
     hits = search_texts(tmp_path, ["안건"])
-    assert len(hits) == 100 and hits[0]["encoding"].endswith("+replace")
+    assert len(hits) == 100 and {h["encoding"] for h in hits} == {"utf-8"}
 
 
 def test_cp949_file_with_binary_tail(write, tmp_path: Path, rng: random.Random) -> None:
     write("memo.txt", ("안건 검토\n" * 100).encode("cp949") + rng.randbytes(5000))
     hits = search_texts(tmp_path, ["안건"])
-    assert len(hits) == 100 and hits[0]["encoding"] == "cp949+replace"
+    assert len(hits) == 100 and {h["encoding"] for h in hits} == {"cp949"}
 
 
 def test_ascii_keyword_in_mostly_binary(write, tmp_path: Path, rng: random.Random) -> None:
@@ -67,7 +67,26 @@ def test_ascii_log_with_one_bad_byte(write, tmp_path: Path) -> None:
     """영문 로그에 깨진 바이트 하나가 섞여도 UTF-16으로 잘못 읽지 않고 검색돼야 한다."""
     write("app.log", b"user login failed password reset requested\n" * 50 + b"\xff\n")
     hits = search_texts(tmp_path, ["password"])
-    assert len(hits) == 50 and hits[0]["encoding"] == "utf-8+replace"
+    assert len(hits) == 50 and {h["encoding"] for h in hits} == {"utf-8"}
+
+
+def test_cp949_after_long_ascii_prefix(write, tmp_path: Path) -> None:
+    """3차 리뷰 재현: 앞 78KB가 영문이고 끝에 CP949 한글이 있는 로그에서 한글을 놓치면 안 된다.
+
+    앞부분(64KB)만 보면 UTF-8로 판정되므로, 전체를 UTF-8 대체 모드로 읽으면 한글이
+    전부 깨져 "검색했는데 없음"으로 보인다.
+    """
+    head = b"[2026-09-30 10:00:00] INFO boot ok\n" * 2300
+    write("late_cp949.log", head + "ERROR 비밀번호 유출\n".encode("cp949"))
+    hits = search_texts(tmp_path, ["비밀번호"])
+    assert [(h["line_no"], h["encoding"]) for h in hits] == [(2301, "cp949")]
+
+
+def test_mixed_utf8_and_cp949_lines(write, tmp_path: Path) -> None:
+    """여러 프로그램이 같은 로그에 써서 UTF-8 줄과 CP949 줄이 섞여도 양쪽 다 찾아야 한다."""
+    write("mixed.log", "앞 비밀번호 A\n".encode("utf-8") * 10 + "뒤 비밀번호 B\n".encode("cp949") * 10)
+    hits = search_texts(tmp_path, ["비밀번호"])
+    assert [h["encoding"] for h in hits] == ["utf-8"] * 10 + ["cp949"] * 10
 
 
 def test_multiple_matches_in_one_line(write, tmp_path: Path) -> None:

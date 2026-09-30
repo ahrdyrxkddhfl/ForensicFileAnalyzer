@@ -10,13 +10,27 @@
        (``textutil.detect_text_encoding``)와 같은 기본 목록(UTF-8 → CP949 → Shift-JIS →
        GBK → CP1252, BOM, BOM 없는 UTF-16)을 쓰므로, 시그니처에서 텍스트로 인정한
        파일은 검색에서도 같은 인코딩으로 읽힌다.
-    2. 고른 인코딩으로 파일 전체를 엄격 모드로 디코딩한다. 끝이 잘린 파일처럼 뒤쪽에서
-       실패하면 깨진 부분만 대체 문자(U+FFFD)로 바꿔 읽고 ``utf-16+replace``처럼 기록한다.
-       어떤 경우에도 디코딩 오류로 검색 전체가 멈추지 않는다.
-    3. 앞부분부터 텍스트가 아니면(예: 텍스트 뒤에 바이너리가 붙은 위장 파일) 목록 중
-       파일 앞에서부터 가장 멀리까지 정상 디코딩되는 인코딩으로 대체 모드로 읽는다.
-       UTF-8 대체 모드는 ASCII 바이트를 그대로 두므로, 파일 대부분이 바이너리여도
-       영문·숫자 키워드는 찾을 수 있다.
+    2. 고른 인코딩이 UTF-8(또는 UTF-16·UTF-32)이면 파일 전체를 엄격 모드로 디코딩한다.
+       성공하면 끝이다.
+    3. 실패했거나, 고른 인코딩이 CP949 같은 레거시 인코딩이면 **줄 단위로** 읽는다.
+       줄마다 UTF-8 → (1번에서 고른 인코딩) → 나머지 목록 순서로 시도한다. 단 CP1252처럼
+       거의 모든 바이트를 받아들이는 인코딩은 앞으로 당기지 않고 항상 마지막에 시도한다.
+       레거시 인코딩을 파일 전체에 바로 적용하지 않는 이유는, CP949가 UTF-8 한글 바이트도
+       엉뚱한 글자로 "성공적으로" 읽어 버려서, UTF-8 줄이 섞인 파일에서 그 줄들을 놓치기
+       때문이다. 처음 성공한 인코딩을 그 줄의 인코딩으로 기록하고, 어떤 인코딩으로도
+       안 되는 줄만 대체 문자(U+FFFD)로 읽어 ``utf-8+replace``처럼 기록한다.
+       이렇게 하면 다음 경우를 모두 놓치지 않는다.
+
+       - 앞부분은 영문이고 뒤에 CP949 한글이 나오는 윈도우 로그(앞부분만 보면 UTF-8로 판정됨)
+       - 여러 프로그램이 같은 로그에 써서 UTF-8 줄과 CP949 줄이 섞인 파일(앞부분만 보면
+         CP949로 판정되고, CP949로 전체를 읽으면 UTF-8 줄이 깨진다)
+       - 텍스트 뒤에 바이너리를 붙인 위장 파일, 끝이 잘린 파일
+
+       UTF-8을 줄마다 가장 먼저 시도하는 이유는, UTF-8 엄격 디코딩은 규칙이 까다로워 다른
+       인코딩의 한글이 우연히 통과하는 일이 거의 없기 때문이다(반대로 CP949는 UTF-8 한글
+       바이트도 엉뚱한 글자로 받아들이는 경우가 많다).
+    4. UTF-16·UTF-32는 줄바꿈 바이트가 달라 줄 단위로 나눌 수 없으므로, 2번이 실패하면
+       깨진 부분만 대체 문자로 읽는다. 어떤 경우에도 디코딩 오류로 검색이 멈추지 않는다.
 
     같은 바이트열이 여러 인코딩으로 동시에 디코딩될 수 있다. 특히 GBK 중국어 문서는
     CP949로도 디코딩되어 자동으로 구분할 수 없으므로 ``--encodings utf-8 gbk``처럼
@@ -36,6 +50,8 @@ from .inventory import KIND_SYMLINK_CYCLE, iter_files
 DEFAULT_ENCODINGS: Tuple[str, ...] = textutil.DEFAULT_LEGACY_ENCODINGS
 # 인코딩을 고를 때 보는 앞부분 크기.
 DETECT_SAMPLE_BYTES = 64 * 1024
+# 거의 모든 바이트를 받아들이는 인코딩. 줄 단위로 읽을 때 앞으로 당기지 않고 항상 마지막에 둔다.
+CATCH_ALL_ENCODINGS = frozenset({"cp1252", "latin-1", "latin1", "iso-8859-1"})
 DEFAULT_INCLUDE_EXTS: Tuple[str, ...] = ("txt", "log", "csv", "json", "xml", "md", "ini", "conf", "reg")
 DEFAULT_MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 
@@ -88,7 +104,8 @@ def search_texts(
 ) -> List[Dict[str, Union[str, int]]]:
     """텍스트 파일들을 줄 단위로 읽으며 검색어를 찾는다.
 
-    한 줄에 같은 검색어가 여러 번 나오면 각각 한 건으로 기록한다.
+    한 줄에 같은 검색어가 여러 번 나오면 각각 한 건으로 기록한다. 결과의 ``encoding``
+    열에는 그 줄을 읽은 인코딩을 기록한다(한 파일 안에서 줄마다 다를 수 있다).
 
     Args:
         root: 검색할 루트 폴더.
@@ -142,13 +159,12 @@ def search_texts(
             _skip(skipped, fpath, "too_large", size)
             continue
 
-        decoded = decode_text_file(fpath, encodings=encodings)
+        decoded = decode_text_lines(fpath, encodings=encodings)
         if decoded is None:
             _skip(skipped, fpath, "read_error", size)
             continue
-        lines, used_encoding = decoded
 
-        for lineno, line in enumerate(lines, start=1):
+        for lineno, (line, used_encoding) in enumerate(decoded, start=1):
             display_line = line.rstrip("\r\n")
             for pat in patterns:
                 for m in pat.finditer(display_line):
@@ -173,40 +189,105 @@ def search_texts(
 
 
 def decode_text_file(path: Path, *, encodings: Sequence[str] = DEFAULT_ENCODINGS) -> Optional[Tuple[List[str], str]]:
-    """파일 전체를 디코딩해 줄 목록과 실제로 사용한 인코딩을 반환한다.
+    """파일 전체를 디코딩해 줄 목록과 사용한 인코딩을 반환한다.
 
-    텍스트 모드로 ``open``만 해서는 디코딩이 일어나지 않고, 읽는 순간 일어난다.
-    그래서 바이트를 먼저 전부 읽은 뒤 디코딩한다(호출 측에서 크기 상한을 건다).
-    디코딩 오류로 예외가 나지 않는다. 처리 순서는 모듈 설명을 참고한다.
+    줄마다 인코딩이 다를 수 있으므로, 검색에는 줄별 인코딩을 주는 ``decode_text_lines``를
+    쓴다. 이 함수는 파일 단위로 결과를 확인할 때 쓰는 요약 버전이다.
 
     Args:
         path: 읽을 파일 경로.
         encodings: 시도할 인코딩 목록(우선순위 순).
 
     Returns:
-        ``(줄 리스트, 인코딩 이름)``. 일부를 대체 문자로 읽었으면 인코딩 이름 뒤에
-        ``+replace``가 붙는다. 파일을 읽지 못하면 None.
+        ``(줄 리스트, 인코딩 이름)``. 줄마다 인코딩이 다르면 ``mixed(utf-8,cp949)``처럼
+        쓰인 인코딩을 모두 적는다. 파일을 읽지 못하면 None.
 
     Example:
         >>> lines, enc = decode_text_file(Path("ForensicTestData/docs/memo_utf16.txt"))
         >>> enc
         'utf-16'
     """
+    decoded = decode_text_lines(path, encodings=encodings)
+    if decoded is None:
+        return None
+    used = list(dict.fromkeys(enc for _, enc in decoded))
+    label = used[0] if len(used) == 1 else ("empty" if not used else f"mixed({','.join(used)})")
+    return [line for line, _ in decoded], label
+
+
+def decode_text_lines(path: Path, *, encodings: Sequence[str] = DEFAULT_ENCODINGS) -> Optional[List[Tuple[str, str]]]:
+    """파일을 읽어 ``(줄, 그 줄의 인코딩)`` 목록으로 반환한다. 디코딩 오류로 예외가 나지 않는다.
+
+    텍스트 모드로 ``open``만 해서는 디코딩이 일어나지 않고, 읽는 순간 일어난다.
+    그래서 바이트를 먼저 전부 읽은 뒤 디코딩한다(호출 측에서 크기 상한을 건다).
+    처리 순서는 모듈 설명을 참고한다.
+
+    Args:
+        path: 읽을 파일 경로.
+        encodings: 시도할 인코딩 목록(우선순위 순).
+
+    Returns:
+        ``(줄 문자열, 인코딩 이름)`` 리스트. 빈 파일이면 빈 리스트, 읽지 못하면 None.
+
+    Example:
+        >>> [enc for _, enc in decode_text_lines(Path("ForensicTestData/docs/memo_cp949.txt"))]
+        ['cp949', 'cp949']
+    """
     try:
         raw = path.read_bytes()
     except OSError:
         return None
     if not raw:
-        return [], "empty"
+        return []
 
     enc = textutil.detect_text_encoding(raw[:DETECT_SAMPLE_BYTES], legacy_encodings=encodings)
-    if enc is None:
-        enc = _pick_encoding_for_broken(raw, encodings)
-    try:
-        return raw.decode(enc).splitlines(keepends=True), enc
-    except UnicodeDecodeError:
-        # 앞부분은 이 인코딩인데 뒤쪽이 깨진 경우(끝이 잘린 파일, 뒤에 붙은 바이너리 등)
-        return raw.decode(enc, errors="replace").splitlines(keepends=True), f"{enc}+replace"
+    if enc is not None and enc.startswith(("utf-8", "utf-16", "utf-32")):
+        try:
+            return [(line, enc) for line in raw.decode(enc).splitlines(keepends=True)]
+        except UnicodeDecodeError:
+            pass
+    if enc is not None and enc.startswith(("utf-16", "utf-32")):
+        text = raw.decode(enc, errors="replace")
+        return [(line, f"{enc}+replace") for line in text.splitlines(keepends=True)]
+
+    base = enc or _pick_encoding_for_broken(raw, encodings)
+    return _decode_per_line(raw, base, encodings)
+
+
+def _decode_per_line(raw: bytes, base: str, encodings: Sequence[str]) -> List[Tuple[str, str]]:
+    """바이트를 줄 단위로 나눠, 줄마다 엄격하게 디코딩되는 인코딩으로 읽는다.
+
+    Args:
+        raw: 파일 바이트(ASCII 호환 인코딩이어야 한다. UTF-16·UTF-32는 호출하지 않는다).
+        base: 파일 전체에서 가장 그럴듯한 인코딩. UTF-8 다음으로 먼저 시도하고(CP1252 같은
+            포괄 인코딩이면 당기지 않음), 어떤 인코딩으로도 안 되는 줄은 이 인코딩의
+            대체 모드로 읽는다.
+        encodings: 시도할 인코딩 목록.
+
+    Returns:
+        ``(줄 문자열, 인코딩 이름)`` 리스트. 대체 모드로 읽은 줄은 ``<base>+replace``.
+
+    Example:
+        >>> _decode_per_line("가\\n".encode("utf-8") + "나\\n".encode("cp949"), "utf-8", ["utf-8", "cp949"])
+        [('가\\n', 'utf-8'), ('나\\n', 'cp949')]
+    """
+    promoted = [base] if base.lower() not in CATCH_ALL_ENCODINGS else []
+    rest = [e for e in encodings if e.lower() not in CATCH_ALL_ENCODINGS]
+    catch_all = [e for e in encodings if e.lower() in CATCH_ALL_ENCODINGS]
+    order = list(dict.fromkeys(
+        (["utf-8"] if "utf-8" in encodings else []) + promoted + rest + catch_all
+    ))
+    out: List[Tuple[str, str]] = []
+    for chunk in raw.splitlines(keepends=True):
+        for e in order:
+            try:
+                out.append((chunk.decode(e), e))
+                break
+            except (UnicodeDecodeError, LookupError):
+                continue
+        else:
+            out.append((chunk.decode(base, errors="replace"), f"{base}+replace"))
+    return out
 
 
 def _valid_prefix_len(raw: bytes, encoding: str) -> int:
