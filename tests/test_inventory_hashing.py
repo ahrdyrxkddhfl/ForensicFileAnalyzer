@@ -55,7 +55,7 @@ def test_follow_mode_blocks_cycles_and_records_broken(write, tmp_path: Path) -> 
     rows = collect_inventory(tmp_path, follow_symlinks=True, errors=errors)
     names = [r["rel_path"] for r in rows]
     assert len([n for n in names if n.endswith(".txt") and "f" in Path(n).name]) == 4
-    assert any("순환" in e["reason"] for e in errors)
+    assert errors and all(e["kind"] == "symlink_cycle" for e in errors)   # 순환 링크는 오류가 아님
     broken = [r for r in rows if r["rel_path"] == "broken.txt"][0]
     assert broken["link_broken"] is True
 
@@ -74,7 +74,7 @@ def test_unreadable_directory_is_recorded(write, tmp_path: Path, monkeypatch: py
     errors: list = []
     rows = collect_inventory(tmp_path, errors=errors)
     assert [r["rel_path"] for r in rows] == ["ok/a.txt"]
-    assert errors and "locked" in errors[0]["path"]
+    assert errors and "locked" in errors[0]["path"] and errors[0]["kind"] == "error"
 
 
 def test_platform_times() -> None:

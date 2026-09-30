@@ -32,6 +32,10 @@ _IS_WINDOWS = os.name == "nt"
 
 Row = Dict[str, Union[str, int, float, bool, None]]
 
+# 스캔 중 기록하는 항목의 종류(errors 리스트의 "kind" 값).
+KIND_ERROR = "error"                  # 읽지 못함 → 확인하지 못한 것이 있다는 뜻(WARN)
+KIND_SYMLINK_CYCLE = "symlink_cycle"  # 순환 링크를 막음 → 정상 동작(INFO)
+
 # 인벤토리 CSV의 기본 열 순서.
 INVENTORY_FIELDS: Tuple[str, ...] = (
     "path", "rel_path", "name", "parent", "size_bytes",
@@ -45,6 +49,7 @@ def iter_files(
     *,
     follow_symlinks: bool = False,
     exclude_globs: Optional[Iterable[str]] = None,
+    exclude_paths: Optional[Iterable[Union[str, Path]]] = None,
     errors: Optional[List[Dict[str, str]]] = None,
 ) -> Iterator[Tuple[Path, bool]]:
     """루트 아래의 파일(과 심볼릭 링크)을 순회한다.
@@ -57,15 +62,19 @@ def iter_files(
         follow_symlinks: 심볼릭 링크를 따라갈지 여부. 모듈 설명의 정책 참고.
         exclude_globs: 제외할 글롭 패턴. 경로는 OS와 상관없이 ``/`` 구분자로 바꿔
             비교하므로 ``*/.git/*`` 같은 패턴이 Windows에서도 동작한다.
-        errors: 읽지 못한 폴더를 ``{"path", "reason"}``로 기록할 리스트. None이면
-            기록하지 않는다. 포렌식에서는 "없음"과 "못 읽음"을 구분해야 하므로
-            조용히 건너뛰지 않고 여기에 남긴다.
+        exclude_paths: 통째로 제외할 폴더·파일 경로. 결과 폴더(또는 결과 파일·기준본)가
+            스캔 대상 안에 있을 때 이전 결과 CSV가 인벤토리에 섞이지 않게 하는 데 쓴다.
+        errors: 스캔 중 생긴 일을 ``{"path", "reason", "kind"}``로 기록할 리스트. None이면
+            기록하지 않는다. ``kind``는 ``error``(읽지 못함) 또는 ``symlink_cycle``(순환
+            링크를 막음, 정상 동작)이다. 포렌식에서는 "없음"과 "못 읽음"을 구분해야
+            하므로 조용히 건너뛰지 않고 여기에 남긴다.
 
     Yields:
         ``(경로, 심볼릭 링크 여부)`` 튜플.
     """
     root = Path(root)
     patterns = tuple(exclude_globs or ())
+    skip_paths = {os.path.abspath(d) for d in (exclude_paths or ())}
     visited: Set[Tuple[int, int]] = set()
     if follow_symlinks:
         try:
@@ -83,12 +92,13 @@ def iter_files(
                 entries = sorted(it, key=lambda e: e.name)
         except OSError as e:
             if errors is not None:
-                errors.append({"path": str(current), "reason": f"폴더 읽기 실패: {e.__class__.__name__}"})
+                errors.append({"path": str(current), "reason": f"폴더 읽기 실패: {e.__class__.__name__}",
+                               "kind": KIND_ERROR})
             continue
 
         for entry in entries:
             path = Path(entry.path)
-            if is_excluded(path, patterns):
+            if is_excluded(path, patterns) or (skip_paths and os.path.abspath(path) in skip_paths):
                 continue
             try:
                 is_link = entry.is_symlink()
@@ -101,7 +111,8 @@ def iter_files(
                         key = (st.st_dev, st.st_ino)
                         if key in visited:
                             if errors is not None:
-                                errors.append({"path": str(path), "reason": "순환 링크: 이미 방문한 폴더"})
+                                errors.append({"path": str(path), "reason": "순환 링크: 이미 방문한 폴더라 건너뜀",
+                                               "kind": KIND_SYMLINK_CYCLE})
                             continue
                         visited.add(key)
                     stack.append(path)
@@ -111,7 +122,8 @@ def iter_files(
                     found.append((path, True))  # 따라가기 모드의 깨진 링크
             except OSError as e:
                 if errors is not None:
-                    errors.append({"path": str(path), "reason": f"항목 확인 실패: {e.__class__.__name__}"})
+                    errors.append({"path": str(path), "reason": f"항목 확인 실패: {e.__class__.__name__}",
+                                   "kind": KIND_ERROR})
 
     found.sort(key=lambda t: str(t[0]))
     yield from found
@@ -122,6 +134,7 @@ def collect_inventory(
     *,
     follow_symlinks: bool = False,
     exclude_globs: Optional[Iterable[str]] = None,
+    exclude_paths: Optional[Iterable[Union[str, Path]]] = None,
     errors: Optional[List[Dict[str, str]]] = None,
 ) -> List[Row]:
     """루트 아래 모든 파일의 메타데이터를 수집해 행 리스트로 반환한다.
@@ -130,7 +143,8 @@ def collect_inventory(
         root: 스캔할 루트 폴더.
         follow_symlinks: 심볼릭 링크를 따라갈지 여부. 모듈 설명의 정책 참고.
         exclude_globs: 제외할 글롭 패턴(예: ``["*.tmp", "*/.git/*"]``).
-        errors: 읽지 못한 폴더·파일을 기록할 리스트. ``iter_files`` 참고.
+        exclude_paths: 통째로 제외할 폴더·파일 경로. ``iter_files`` 참고.
+        errors: 스캔 중 생긴 일을 기록할 리스트. ``iter_files`` 참고.
 
     Returns:
         ``rel_path`` 순으로 정렬된 행 리스트. 각 행의 열은 ``INVENTORY_FIELDS``이며
@@ -144,7 +158,7 @@ def collect_inventory(
     root = Path(root).resolve()
     rows: List[Row] = []
     for fpath, is_link in iter_files(
-        root, follow_symlinks=follow_symlinks, exclude_globs=exclude_globs, errors=errors
+        root, follow_symlinks=follow_symlinks, exclude_globs=exclude_globs, exclude_paths=exclude_paths, errors=errors
     ):
         broken = False
         try:
@@ -152,14 +166,14 @@ def collect_inventory(
         except OSError:
             if not is_link:
                 if errors is not None:
-                    errors.append({"path": str(fpath), "reason": "메타데이터 읽기 실패"})
+                    errors.append({"path": str(fpath), "reason": "메타데이터 읽기 실패", "kind": KIND_ERROR})
                 continue
             try:
                 st = os.lstat(fpath)  # 깨진 링크: 링크 자체 정보라도 남긴다.
                 broken = True
             except OSError:
                 if errors is not None:
-                    errors.append({"path": str(fpath), "reason": "메타데이터 읽기 실패"})
+                    errors.append({"path": str(fpath), "reason": "메타데이터 읽기 실패", "kind": KIND_ERROR})
                 continue
 
         if is_link and not follow_symlinks and not os.path.exists(fpath):

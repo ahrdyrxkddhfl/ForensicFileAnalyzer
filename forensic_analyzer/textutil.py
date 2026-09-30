@@ -21,6 +21,7 @@ Example:
 from __future__ import annotations
 
 import math
+import re
 from collections import Counter
 from typing import Iterable, Optional, Tuple
 
@@ -35,15 +36,18 @@ STRICT_PRINTABLE_RATIO: dict = {"cp1252": 0.97}
 # UTF-8·CP949 문서에는 NUL이 거의 없다. NUL이 많으면 UTF-16이거나 바이너리다.
 MAX_LEGACY_NUL_RATIO = 0.01
 
+# 이 길이 이상 이어진 NUL 구간은 레거시 판별 전에 떼어 놓는다. 미리 할당된 로그나
+# 크래시로 중간이 0으로 채워진 로그에 흔하다. UTF-16 텍스트의 NUL은 글자 사이에 한두
+# 개씩 흩어져 있으므로 이 처리에 영향을 받지 않는다.
+_NUL_RUN = re.compile(rb"\x00{8,}")
+
 # 기본으로 시도하는 레거시 인코딩. 한국 수사 환경을 우선하고 일본어·중국어·서유럽을 보조로 둔다.
 # cp1252는 거의 모든 바이트를 받아들이므로 반드시 마지막에 둔다.
 DEFAULT_LEGACY_ENCODINGS: Tuple[str, ...] = ("utf-8", "cp949", "shift_jis", "gbk", "cp1252")
 
 # BOM 없는 UTF-16 판별 기준. 아래 "detect_utf16_without_bom" 참고.
-UTF16_NUL_PARITY_MIN = 0.05   # ASCII가 섞인 UTF-16: NUL이 몰린 쪽 자리의 NUL 비율 하한
-UTF16_NUL_PARITY_FACTOR = 2.0  # NUL이 몰린 쪽이 반대쪽보다 최소 몇 배 많아야 하는지
-# 한글 음절 중 일부(예: '밀' U+BC00)는 한 바이트가 0x00이라 반대쪽 자리에도 NUL이
-# 조금 생긴다. 그래서 "반대쪽은 0"이 아니라 "몰린 쪽이 충분히 많다"로 판단한다.
+UTF16_NUL_PARITY_MIN = 0.05   # 이 비율 이상 NUL이 한쪽 자리에 있으면 "ASCII가 섞인 UTF-16" 후보
+UTF16_PLAUSIBLE_MIN_RATIO = 0.9  # ASCII가 섞인 UTF-16: 그럴듯한 글자 비율 하한
 UTF16_CJK_MIN_RATIO = 0.9     # ASCII가 거의 없는 UTF-16: 한중일 문자 비율 하한
 UTF16_MIN_JUDGE_BYTES = 16     # 이보다 짧은 UTF-16 본문은 분포로 판단할 수 없다(8글자)
 # ASCII 소문자 두 글자(예: "pl" = 0x706C)를 UTF-16으로 읽으면 한자 범위에 들어간다.
@@ -71,6 +75,9 @@ ENTROPY_MIN_BYTES = 256
 
 # 텍스트에 정상적으로 들어가는 제어 문자. ESC(\x1b)는 색상 코드가 들어간 터미널 로그에 흔하다.
 _ALLOWED_CONTROL_CHARS = frozenset("\t\n\r\f\v\x1b")
+
+# 출력 가능한 ASCII와 탭·줄바꿈 바이트(빠른 계산용 삭제 표).
+_ASCII_TEXT_BYTES = bytes(range(0x20, 0x7F)) + b"\t\n\r"
 
 # 한중일 문자 범위(한글 음절, 한중일 통합 한자, 가나, 한중일 문장부호, 전각 문자).
 _CJK_RANGES: Tuple[Tuple[int, int], ...] = (
@@ -149,23 +156,26 @@ def _ascii_byte_ratio(buf: bytes) -> float:
     """
     if not buf:
         return 0.0
-    return sum(1 for b in buf if 0x20 <= b <= 0x7E or b in (0x09, 0x0A, 0x0D)) / len(buf)
+    return (len(buf) - len(buf.translate(None, _ASCII_TEXT_BYTES))) / len(buf)
 
 
 def detect_utf16_without_bom(buf: bytes, *, partial: bool = False) -> Optional[str]:
     """BOM 없는 UTF-16 텍스트인지 판별해 ``utf-16-le`` / ``utf-16-be``를 반환한다.
 
     아무 바이트열이나 UTF-16으로 억지로 읽으면 "출력 가능한 한자"처럼 보이는 경우가
-    많아, 디코딩 성공만으로는 판별할 수 없다. 그래서 두 가지 경우만 인정한다.
+    많아, 디코딩 성공만으로는 판별할 수 없다. 그래서 두 바이트 순서로 모두 읽어 보고,
+    아래 조건을 통과한 쪽 중 "그럴듯한 글자" 비율이 가장 높은 쪽을 고른다.
 
     1. ASCII(공백·줄바꿈·숫자 포함)가 섞인 UTF-16: 이 문자들은 한 바이트가 0x00이므로
-       NUL이 **한쪽 자리(짝수 또는 홀수 번째)에** 몰려 나타난다.
-       예: ``"A한"`` → UTF-16 LE ``41 00 5C D5`` (NUL이 홀수 자리에만 있음)
+       NUL이 적어도 한쪽 자리에 어느 정도(5% 이상) 나타난다. 이때는 디코딩 결과의
+       대부분(90% 이상)이 ASCII·라틴·문장부호·한중일 문자여야 한다.
+       예: ``"A한"`` → UTF-16 LE ``41 00 5C D5`` (NUL이 홀수 자리)
     2. ASCII가 거의 없는 UTF-16: 디코딩한 글자의 대부분이 한글·한자·가나이고,
-       원본 바이트의 대부분이 ASCII는 아니다(ASCII 문서를 한자로 오인하지 않도록).
+       원본 바이트의 대부분이 ASCII는 아니어야 한다(ASCII 문서를 한자로 오인하지 않도록).
 
-    무작위 바이트는 NUL이 양쪽 자리에 고르게 흩어지고, 디코딩한 글자가 유니코드 전
-    영역에 퍼지므로 두 조건을 모두 통과하지 못한다.
+    무작위 바이트는 디코딩한 글자가 유니코드 전 영역에 퍼져 두 조건을 통과하지 못한다.
+    한글 음절 중 일부(예: '밀' U+BC00)는 한 바이트가 0x00이라 NUL이 양쪽 자리에 섞이므로,
+    "NUL이 한쪽에만 있다" 같은 분포 비율 대신 디코딩 결과로 판단한다.
 
     Args:
         buf: 검사할 바이트열.
@@ -180,43 +190,29 @@ def detect_utf16_without_bom(buf: bytes, *, partial: bool = False) -> Optional[s
         >>> detect_utf16_without_bom(b"plain ascii text") is None
         True
     """
-    offsets = (0, 1) if partial else (0,)
-    for off in offsets:
+    best: Optional[Tuple[float, str]] = None
+    for off in ((0, 1) if partial else (0,)):
         body = buf[off:]
         body = body[: len(body) - (len(body) % 2)]
-        units = len(body) // 2
         if len(body) < UTF16_MIN_JUDGE_BYTES:
             continue
-        nul_even = sum(1 for i in range(0, len(body), 2) if body[i] == 0) / units
-        nul_odd = sum(1 for i in range(1, len(body), 2) if body[i] == 0) / units
+        units = len(body) // 2
+        # 바이트 슬라이싱으로 세면 C 수준 속도라 큰 파일에서도 빠르다.
+        has_ascii = max(body[0::2].count(0), body[1::2].count(0)) / units >= UTF16_NUL_PARITY_MIN
+        cjk_allowed = _ascii_byte_ratio(body) < UTF16_CJK_MAX_ASCII_RATIO
 
-        candidates = []
-        if nul_odd >= UTF16_NUL_PARITY_MIN and nul_odd >= nul_even * UTF16_NUL_PARITY_FACTOR:
-            candidates.append(("utf-16-le", False))   # LE: ASCII의 0x00이 뒤(홀수 자리)
-        elif nul_even >= UTF16_NUL_PARITY_MIN and nul_even >= nul_odd * UTF16_NUL_PARITY_FACTOR:
-            candidates.append(("utf-16-be", False))   # BE: ASCII의 0x00이 앞(짝수 자리)
-        # ASCII가 거의 없는 한중일 문서는 NUL 분포로 판단할 수 없다. '一'(U+4E00)처럼 한
-        # 바이트가 0x00인 글자 때문에 NUL이 한쪽에 몰려 보이기도 하므로, NUL 분포와
-        # 상관없이 양쪽 바이트 순서를 모두 "한중일 문자 비율" 기준으로 한 번 더 확인한다.
-        # 단, 바이트 대부분이 ASCII면 UTF-16이 아니라 ASCII 문서이므로 제외한다.
-        if _ascii_byte_ratio(body) < UTF16_CJK_MAX_ASCII_RATIO:
-            candidates += [("utf-16-le", True), ("utf-16-be", True)]
-
-        # 두 바이트 순서가 모두 통과할 수 있다(예: 한글 LE를 BE로 읽어도 한자처럼 보임).
-        # 그래서 통과한 후보 중 "그럴듯한 글자" 비율이 가장 높은 쪽을 고른다.
-        best: Optional[Tuple[float, str]] = None
-        for enc, need_cjk in candidates:
+        for enc in ("utf-16-le", "utf-16-be"):
             text = decode_tolerant(body, enc, trim_end=(0, 2))
             if text is None or printable_ratio(text) < MIN_PRINTABLE_RATIO:
                 continue
-            if need_cjk and _cjk_ratio(text) < UTF16_CJK_MIN_RATIO:
-                continue
             score = _plausible_ratio(text)
-            if best is None or score > best[0]:
+            if has_ascii:
+                ok = score >= UTF16_PLAUSIBLE_MIN_RATIO
+            else:
+                ok = cjk_allowed and _cjk_ratio(text) >= UTF16_CJK_MIN_RATIO
+            if ok and (best is None or score > best[0]):
                 best = (score, enc)
-        if best is not None:
-            return best[1]
-    return None
+    return best[1] if best else None
 
 
 def shannon_entropy(buf: bytes) -> float:
@@ -338,7 +334,8 @@ def detect_text_encoding(
         1. BOM 텍스트(UTF-8/16/32)
         2. NUL이 거의 없으면 레거시 인코딩(UTF-8 → CP949 → Shift-JIS → GBK → CP1252)
         3. BOM 없는 UTF-16 LE/BE (``detect_utf16_without_bom``)
-    크래시로 잘린 로그처럼 끝이 NUL로 채워진 파일은 끝의 NUL을 제거하고 판단한다.
+    크래시로 잘린 로그처럼 끝이 NUL로 채워진 파일은 끝의 NUL을 제거하고, 중간에 NUL이
+    길게(8바이트 이상) 이어진 구간은 떼어 놓고 판단한다.
 
     ASCII 문서는 2단계에서 먼저 확정되므로 3단계(UTF-16)로 잘못 가지 않는다.
     ASCII 바이트를 UTF-16으로 억지로 읽으면 출력 가능한 한자처럼 보이기 때문에
@@ -372,9 +369,10 @@ def detect_text_encoding(
         if bom:
             return bom
 
-    if body.count(0) / len(body) <= MAX_LEGACY_NUL_RATIO:
+    legacy = _NUL_RUN.sub(b"", body)
+    if legacy and legacy.count(0) / len(legacy) <= MAX_LEGACY_NUL_RATIO:
         for enc in legacy_encodings:
-            text = decode_tolerant(body, enc, trim_start=start)
+            text = decode_tolerant(legacy, enc, trim_start=start)
             need = STRICT_PRINTABLE_RATIO.get(enc, MIN_PRINTABLE_RATIO)
             if text is not None and printable_ratio(text) >= need:
                 return enc

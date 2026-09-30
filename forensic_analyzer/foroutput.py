@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import csv
 import datetime
+import json
 import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 
 # 엑셀이 수식으로 해석하는 첫 글자. 파일명은 증거 제작자가 마음대로 정할 수 있으므로,
@@ -86,6 +87,11 @@ def sanitize_label(label: str) -> str:
 def escape_formula(value: object) -> object:
     """엑셀 수식으로 해석될 수 있는 문자열 앞에 작은따옴표를 붙인다(CSV 수식 주입 방지).
 
+    나중에 ``unescape_formula``로 **정확히** 원래 값을 되찾을 수 있어야 한다. 그래서
+    원래부터 작은따옴표로 시작하는 값에도 작은따옴표를 하나 더 붙인다. 그렇지 않으면
+    ``'=y.txt``라는 실제 파일명이 읽을 때 ``=y.txt``로 바뀌어, 기준본과 비교할 때 바뀌지
+    않은 파일이 "이동"이나 "삭제+추가"로 나온다.
+
     숫자 값(int·float)과 숫자로 읽히는 문자열(예: ``-1.5``)은 그대로 둔다.
 
     Args:
@@ -97,10 +103,16 @@ def escape_formula(value: object) -> object:
     Example:
         >>> print(escape_formula('=HYPERLINK("http://x")'))
         '=HYPERLINK("http://x")
+        >>> print(escape_formula("'=y.txt"))
+        ''=y.txt
         >>> escape_formula("-1.5")
         '-1.5'
     """
-    if not isinstance(value, str) or not value.startswith(FORMULA_PREFIXES):
+    if not isinstance(value, str) or not value:
+        return value
+    if value.startswith(FORMULA_ESCAPE):
+        return FORMULA_ESCAPE + value
+    if not value.startswith(FORMULA_PREFIXES):
         return value
     try:
         float(value)
@@ -112,15 +124,20 @@ def escape_formula(value: object) -> object:
 def unescape_formula(value: str) -> str:
     """``escape_formula``로 붙인 작은따옴표를 떼어 원래 값으로 되돌린다.
 
+    ``escape_formula``는 작은따옴표로 시작하는 값 앞에 항상 작은따옴표를 하나 붙이므로,
+    읽을 때는 맨 앞 작은따옴표 하나만 떼면 원래 값이 된다.
+
     Args:
         value: CSV에서 읽은 값.
 
     Returns:
         원래 값.
+
+    Example:
+        >>> unescape_formula("''=y.txt")
+        "'=y.txt"
     """
-    if value.startswith(FORMULA_ESCAPE) and value[1:].startswith(FORMULA_PREFIXES):
-        return value[1:]
-    return value
+    return value[1:] if value.startswith(FORMULA_ESCAPE) else value
 
 
 def build_fieldnames(rows: Sequence[Mapping[str, object]], preferred: Iterable[str]) -> List[str]:
@@ -188,6 +205,48 @@ def write_rows_csv(
             w.writeheader()
             for r in rows:
                 w.writerow({k: escape_formula(r.get(k, "")) for k in fieldnames})
+        os.replace(tmp_name, out_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return out_path
+
+
+def meta_path_for(csv_path: Path) -> Path:
+    """CSV에 딸린 스캔 정보 파일 경로를 만든다(``baseline.csv`` → ``baseline.meta.json``).
+
+    Args:
+        csv_path: 인벤토리 CSV 경로.
+
+    Returns:
+        스캔 정보 JSON 경로.
+    """
+    csv_path = Path(csv_path)
+    return csv_path.with_name(f"{csv_path.stem}.meta.json")
+
+
+def write_json(data: Mapping[str, Any], out_path: Path) -> Path:
+    """딕셔너리를 JSON으로 원자적으로 저장한다(UTF-8, 사람이 읽기 좋게 들여쓰기).
+
+    Args:
+        data: 저장할 내용.
+        out_path: 저장 경로. 상위 폴더가 없으면 만든다.
+
+    Returns:
+        저장한 경로.
+
+    Raises:
+        OSError: 저장에 실패했을 때. 이때 임시 파일은 지우고 예외를 다시 던진다.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=out_path.parent, prefix=".tmp_", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp_name, out_path)
     except BaseException:
         try:

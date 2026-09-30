@@ -58,8 +58,9 @@ def test_label_is_sanitized_and_outputs_not_overwritten(data: Path, tmp_path: Pa
     out_dir = tmp_path / "out"
     for _ in range(2):
         _run(["inventory", str(data), "--out-dir", str(out_dir), "--label", "../../escape"])
-    files = sorted(p.name for p in out_dir.iterdir())
+    files = sorted(p.name for p in out_dir.iterdir() if p.suffix == ".csv")
     assert len(files) == 2 and all("/" not in f for f in files)
+    assert len([p for p in out_dir.iterdir() if p.name.endswith(".meta.json")]) == 2
     assert not (tmp_path.parent / "escape").exists()
 
 
@@ -87,3 +88,33 @@ def test_baseline_roundtrip_via_cli(data: Path, tmp_path: Path) -> None:
     _run(["inventory", str(data), "--with-hash", "--out", str(base)])
     _run(["validate", str(data), "--baseline", str(base), "--out-issues", str(issues)])
     assert _read(issues) == []
+
+
+def test_outputs_inside_root_are_excluded(data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """루트를 . 으로 줘도 이전 결과 CSV가 인벤토리에 섞이면 안 된다."""
+    import shutil
+    case = tmp_path / "case"
+    shutil.copytree(data, case, symlinks=True)
+    monkeypatch.chdir(case)
+    _run(["inventory", ".", "--with-hash", "--out", "outputs/baseline.csv"])
+    _run(["inventory", ".", "--out", "outputs/second.csv"])
+    assert not any(r["rel_path"].startswith("outputs/") for r in _read(case / "outputs" / "second.csv"))
+    _run(["validate", ".", "--baseline", "outputs/baseline.csv", "--out-issues", "outputs/issues.csv"])
+    assert _read(case / "outputs" / "issues.csv") == []
+
+
+def test_scan_options_are_recorded_and_compared(data: Path, tmp_path: Path) -> None:
+    import json
+    base = tmp_path / "baseline.csv"
+    _run(["inventory", str(data), "--with-hash", "--out", str(base)])
+    meta = json.loads((tmp_path / "baseline.meta.json").read_text(encoding="utf-8"))
+    assert meta["follow_symlinks"] is False and meta["hash_algorithms"] == ["md5", "sha256"]
+
+    issues = tmp_path / "issues.csv"
+    _run(["validate", str(data), "--baseline", str(base), "--exclude", "*.log", "--out-issues", str(issues)])
+    codes = {r["code"] for r in _read(issues)}
+    assert "BASELINE_OPTIONS_DIFFER" in codes      # 제외 옵션이 달라서 생긴 결과임을 알림
+
+    (tmp_path / "baseline.meta.json").unlink()
+    _run(["validate", str(data), "--baseline", str(base), "--out-issues", str(issues)])
+    assert [r["code"] for r in _read(issues)] == ["BASELINE_META_MISSING"]

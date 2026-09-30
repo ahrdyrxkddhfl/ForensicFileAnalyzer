@@ -31,6 +31,15 @@ def _zip_bytes(tmp_path: Path, member: str) -> bytes:
     return data
 
 
+ELF = b"\x7fELF\x02\x01\x01" + bytes(57) + b"\x00" * 400
+TIFF = b"II*\x00\x08\x00\x00\x00" + bytes(500)
+CR2 = b"II*\x00\x10\x00\x00\x00CR\x02\x00" + bytes(500)   # 캐논 RAW: TIFF 헤더 + "CR"
+
+
+def _ftyp(brand: bytes) -> bytes:
+    return b"\x00\x00\x00\x18ftyp" + brand + bytes(500)
+
+
 def _pe_bytes() -> bytes:
     """최소 구조의 윈도우 PE(EXE) 헤더."""
     return (b"MZ" + b"\x90" * 58 + (0x80).to_bytes(4, "little") + b"\x00" * (0x80 - 0x40)
@@ -51,6 +60,8 @@ def test_must_detect(write, tmp_path: Path, rng: random.Random, magic: bool) -> 
         "exe_as.txt": _pe_bytes(),
         "docx_as.txt": _zip_bytes(tmp_path, "word/document.xml"),   # 확장자만 바꾼 문서
         "fake.exe": b"not really an executable\n" * 20,
+        "elf_as.jpg": ELF,                                         # 사진으로 위장한 리눅스 실행 파일
+        "raw_as.png": CR2,
     }
     for name, data in cases.items():
         assert _mismatch(write(name, data), magic), name
@@ -77,6 +88,19 @@ def test_must_not_flag(write, tmp_path: Path, rng: random.Random, magic: bool) -
         "clip.webp": b"RIFF" + (500).to_bytes(4, "little") + b"WEBPVP8 " + bytes(500),
         "photo.heic": b"\x00\x00\x00\x18ftypheic" + bytes(500),
         "mail.eml": b"From: a@b.c\nSubject: hi\n\nbody\n" * 20,
+        # 2차 리뷰에서 재현된 오탐: 리눅스 실행 파일·라이브러리
+        "ls": ELF, "libc.so.6": ELF, "mod.ko": ELF,
+        # 카메라 RAW(TIFF 구조)
+        "IMG_0001.CR2": CR2, "DSC_0001.NEF": TIFF, "photo.dng": TIFF,
+        # ftyp 계열 세부 형식
+        "clip.m4v": _ftyp(b"M4V "), "img.avif": _ftyp(b"avif"), "odd_brand.mp4": _ftyp(b"zzzz"),
+        # ZIP·gzip 계열
+        "doc.pages": _zip_bytes(tmp_path, "Index/Document.iwa"), "pkg.whl": _zip_bytes(tmp_path, "pkg/__init__.py"),
+        "a.tgz": b"\x1f\x8b\x08\x00" + rng.randbytes(600),
+        # 중간이 0으로 채워진 로그, 텍스트 키 파일, 모르는 확장자
+        "midnul.log": b"[INFO] ok\n" * 300 + b"\x00" * 4096 + b"[INFO] resumed\n" * 300,
+        "server.key": b"-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----\n",
+        "blob.xyz": PNG,
         "Info.plist": b'<?xml version="1.0"?>\n<plist version="1.0"><dict/></plist>\n' * 10,
         "data.bin": rng.randbytes(4096),
         "empty.txt": b"",
@@ -117,12 +141,17 @@ def test_symlink_not_followed_is_not_judged(tmp_path: Path, write) -> None:
 
 @pytest.mark.parametrize("disk,mime,ext,expected", [
     (".jpg", "image/png", ".png", True),
+    ("", "application/x-executable", "", False),   # 확장자 없는 실행 파일은 정상
+    ("", "application/pdf", ".pdf", True),         # 확장자를 떼어 숨긴 PDF
+    (".6", "application/x-executable", "", False), # 모르는 확장자는 판정 불가
+    (".cr2", "image/x-canon-cr2", "", False),
     (".txt", "application/octet-stream", "", True),
     (".png", "application/octet-stream", "", True),
     (".bin", "application/octet-stream", "", False),
     (".txt", "inode/x-empty", "", False),
     ("", "image/png", ".png", True),
     ("", "text/plain", ".txt", False),
+    ("", "application/vnd.sqlite3", ".sqlite", False),
     (".JPEG", "image/jpeg", ".jpg", False),
     (".hwp", "application/x-ole-storage", ".doc", False),
     (".db", "application/CDFV2", "", False),

@@ -47,6 +47,9 @@ SAMPLE_BYTES = 8192
 # OS의 mime.types 설정 파일을 읽지 않는 독립 인스턴스. PC마다 결과가 달라지지 않게 한다.
 _MIME_DB = mimetypes.MimeTypes()
 
+# 같은 형식의 확장자 표기 차이를 하나로 통일한다.
+_KNOWN_EXT_NORMALIZE = {".jpe": ".jpg", ".jpeg": ".jpg", ".tif": ".tiff", ".htm": ".html"}
+
 # (오프셋, 매직 바이트, MIME, 대표 확장자). 긴 시그니처를 먼저 둬서 오판을 줄인다.
 SIGNATURES: Tuple[Tuple[int, bytes, str, str], ...] = (
     (0, b"\x89PNG\r\n\x1a\n", "image/png", ".png"),
@@ -79,9 +82,23 @@ RIFF_FORMS: Dict[bytes, Tuple[str, str]] = {
     b"WEBP": ("image/webp", ".webp"), b"WAVE": ("audio/x-wav", ".wav"), b"AVI ": ("video/x-msvideo", ".avi"),
 }
 FTYP_BRANDS: Dict[bytes, Tuple[str, str]] = {
-    b"heic": ("image/heic", ".heic"), b"heix": ("image/heic", ".heic"), b"mif1": ("image/heic", ".heic"),
-    b"qt  ": ("video/quicktime", ".mov"), b"M4A ": ("audio/mp4", ".m4a"),
+    b"heic": ("image/heic", ".heic"), b"heix": ("image/heic", ".heic"), b"mif1": ("image/heif", ".heif"),
+    b"avif": ("image/avif", ".avif"), b"avis": ("image/avif", ".avif"),
+    b"qt  ": ("video/quicktime", ".mov"), b"M4A ": ("audio/mp4", ".m4a"), b"M4V ": ("video/x-m4v", ".m4v"),
+    b"3gp4": ("video/3gpp", ".3gp"), b"3gp5": ("video/3gpp", ".3gp"), b"3gp6": ("video/3gpp", ".3gp"),
+    b"3g2a": ("video/3gpp2", ".3g2"), b"crx ": ("image/x-canon-cr3", ".cr3"),
 }
+# ftyp로 시작하는 ISO 기본 미디어 형식 계열. 브랜드가 수십 가지라 세부 형식끼리는
+# 서로 바꿔 붙여도 불일치로 보지 않는다(모르는 브랜드는 video/mp4로 처리).
+ISO_BMFF_FAMILY: FrozenSet[str] = frozenset({
+    ".mp4", ".m4v", ".m4a", ".m4b", ".m4p", ".mov", ".qt", ".3gp", ".3g2",
+    ".heic", ".heif", ".avif", ".avifs", ".f4v", ".cr3",
+})
+# TIFF 구조를 쓰는 카메라 RAW 형식(캐논·니콘·어도비 DNG·소니 등).
+TIFF_FAMILY: FrozenSet[str] = frozenset({
+    ".tiff", ".cr2", ".nef", ".nrw", ".dng", ".arw", ".srf", ".sr2", ".orf", ".rw2", ".pef", ".srw",
+    ".3fr", ".erf", ".kdc", ".dcr", ".mos", ".iiq",
+})
 
 # 내용이 일반 텍스트인 확장자.
 TEXT_FAMILY: FrozenSet[str] = frozenset({
@@ -89,6 +106,7 @@ TEXT_FAMILY: FrozenSet[str] = frozenset({
     ".txt", ".log", ".csv", ".tsv", ".json", ".xml", ".md", ".reg",
     ".ini", ".conf", ".cfg", ".yaml", ".yml", ".toml", ".srt", ".vtt",
     ".plist", ".svg", ".rtf", ".eml", ".vcf", ".ics", ".mbox", ".properties",  # XML plist·메일·연락처·일정
+    ".pem", ".key",  # 텍스트 인증서·키(.key는 맥 Keynote 문서와 겹치므로 ZIP 계열에도 둔다)
     # 웹·스크립트·소스 코드
     ".html", ".css", ".js", ".ts", ".py", ".sh", ".bat", ".ps1",
     ".sql", ".java", ".kt", ".c", ".h", ".cpp", ".go", ".rs", ".rb", ".php",
@@ -97,12 +115,19 @@ TEXT_FAMILY: FrozenSet[str] = frozenset({
 # 내부 구조가 ZIP / OLE(복합 문서)인 형식. 한컴 HWP(5.x)는 OLE, HWPX는 ZIP이다.
 ZIP_FAMILY: FrozenSet[str] = frozenset({
     ".zip", ".docx", ".xlsx", ".pptx", ".docm", ".xlsm", ".pptm",
-    ".odt", ".ods", ".odp", ".hwpx", ".epub", ".jar", ".apk", ".aar", ".ipa",
+    ".odt", ".ods", ".odp", ".odg", ".hwpx", ".epub", ".jar", ".war", ".ear",
+    ".apk", ".aar", ".aab", ".apks", ".xapk", ".ipa",                 # 안드로이드·iOS 앱
+    ".pages", ".numbers", ".key",                                      # 맥 iWork 문서
+    ".whl", ".xpi", ".nupkg", ".vsix", ".appx", ".msix",               # 패키지
+    ".kmz", ".3mf", ".xps", ".oxps", ".cbz", ".usdz",
 })
 OLE_FAMILY: FrozenSet[str] = frozenset({
     ".doc", ".xls", ".ppt", ".msg", ".hwp", ".msi",
     ".db",  # Windows 썸네일 캐시 Thumbs.db는 OLE 형식이다.
 })
+
+# 리눅스·안드로이드 ELF 실행 파일·라이브러리 계열 확장자. 확장자가 없는 것이 가장 흔하다.
+_ELF_EXTS: FrozenSet[str] = frozenset({".so", ".elf", ".bin", ".o", ".ko", ".axf", ".prx", ".out", ".mod", ".oat", ".odex"})
 
 # 윈도우 PE(MZ로 시작하는 실행 파일) 계열 확장자.
 _PE_EXTS: FrozenSet[str] = frozenset({".exe", ".dll", ".sys", ".scr", ".ocx", ".cpl", ".com", ".efi", ".mui", ".drv"})
@@ -138,19 +163,40 @@ EXTRA_ALLOWED_EXTS: Dict[str, FrozenSet[str]] = {
     "application/x-7z-compressed": frozenset({".7z"}),
     "application/vnd.rar": frozenset({".rar"}),
     "application/x-rar": frozenset({".rar"}),
-    "application/x-executable": frozenset({".so", ".elf", ".bin", ".o"}),
-    "application/x-sharedlib": frozenset({".so", ".elf", ".bin"}),
-    "application/x-pie-executable": frozenset({".so", ".elf", ".bin"}),
+    "application/x-executable": _ELF_EXTS,
+    "application/x-sharedlib": _ELF_EXTS,
+    "application/x-pie-executable": _ELF_EXTS,
+    "application/x-object": _ELF_EXTS,
+    "application/x-coredump": _ELF_EXTS | {".core"},
+    "application/gzip": frozenset({".gz", ".tgz", ".gzip", ".svgz"}),
+    "application/x-gzip": frozenset({".gz", ".tgz", ".gzip", ".svgz"}),
+    "image/tiff": TIFF_FAMILY,
     "audio/mpeg": frozenset({".mp3"}),
-    "image/heic": frozenset({".heic", ".heif"}),
+    **{m: ISO_BMFF_FAMILY for m in (
+        "video/mp4", "video/quicktime", "audio/mp4", "audio/x-m4a", "video/x-m4v", "video/3gpp", "video/3gpp2",
+        "image/heic", "image/heif", "image/avif", "image/x-canon-cr3",
+    )},
 }
+
+# 허용 확장자를 판단할 수 있는(= 이 도구가 아는) 확장자 전체. 여기에 없는 확장자는
+# 불일치 여부를 판정할 근거가 없으므로 "판정 불가"로 두고 불일치로 보지 않는다.
+# 예: libc.so.6의 ".6", 커널 모듈 ".ko"(ELF 허용 목록에 있음), 임의의 ".dat"
+KNOWN_EXTS: FrozenSet[str] = frozenset(
+    set(TEXT_FAMILY) | set(ZIP_FAMILY) | set(OLE_FAMILY) | set(TIFF_FAMILY) | set(ISO_BMFF_FAMILY)
+    | {e for exts in EXTRA_ALLOWED_EXTS.values() for e in exts}
+    | {_KNOWN_EXT_NORMALIZE.get(e, e) for e in _MIME_DB.types_map[True]}
+)
+
+# 확장자가 없을 때 불일치로 보는 형식: 사진·영상·음성·PDF처럼 보통 확장자가 붙는 사용자
+# 데이터. 실행 파일(리눅스는 확장자가 없는 게 정상)·텍스트·DB는 확장자가 없어도 흔하다.
+NOEXT_SUSPICIOUS_PREFIXES: Tuple[str, ...] = ("image/", "video/", "audio/", "application/pdf")
 
 # 정상이라면 반드시 알려진 시그니처로 시작하는 확장자.
 # .db는 SQLite 외에도 형식이 제각각이라 시그니처를 강제하지 않는다.
 SIGNATURE_REQUIRED_EXTS: FrozenSet[str] = frozenset(
     (ZIP_FAMILY | OLE_FAMILY | {".png", ".jpg", ".gif", ".pdf", ".sqlite", ".sqlite3", ".gz",
                                 ".exe", ".dll", ".7z", ".rar", ".bmp", ".webp", ".wav", ".tiff", ".flac", ".ogg",
-                                ".heic"}) - {".db"}
+                                ".heic"}) - {".db", ".key"}   # .key는 텍스트 키 파일일 수도 있음
 )
 
 EMPTY_MIMES: FrozenSet[str] = frozenset({"inode/x-empty", "application/x-empty"})
@@ -164,7 +210,6 @@ SOURCE_UNKNOWN = "unknown"
 SOURCE_ERROR = "error"
 SOURCE_SYMLINK = "symlink"
 
-_KNOWN_EXT_NORMALIZE = {".jpe": ".jpg", ".jpeg": ".jpg", ".tif": ".tiff", ".htm": ".html"}
 
 
 def probe_file_type(path: Union[str, Path], *, prefer_magic: bool = True) -> Optional[Dict[str, object]]:
@@ -185,8 +230,6 @@ def probe_file_type(path: Union[str, Path], *, prefer_magic: bool = True) -> Opt
           정상 ZIP·JPEG도 True이므로 이것만으로 의심 파일이라고 볼 수 없다.
         - ``embedded_binary`` (bool): 앞부분은 텍스트인데 중간·끝 구간에 텍스트가
           아닌 데이터가 있으면 True.
-        - ``small_sample`` (bool): 파일이 ``textutil.RELIABLE_TEXT_MIN_BYTES``보다 작아
-          텍스트 판별 신뢰도가 낮으면 True.
         - ``fallback_mime`` / ``fallback_ext`` (str): 내장 판별(매직 넘버 표·텍스트 판별)
           결과. libmagic이 허용 확장자를 알 수 없는 MIME을 내놓았을 때 판정에 쓴다.
 
@@ -198,7 +241,6 @@ def probe_file_type(path: Union[str, Path], *, prefer_magic: bool = True) -> Opt
     if samples is None:
         return None
     head, others = samples
-    size_small = len(head) < textutil.RELIABLE_TEXT_MIN_BYTES and not others
 
     if not head:
         return _result("inode/x-empty", "", "empty", SOURCE_HEADER)
@@ -221,7 +263,6 @@ def probe_file_type(path: Union[str, Path], *, prefer_magic: bool = True) -> Opt
     result["fallback_ext"] = header["real_ext"]
 
     result["high_entropy"] = any(textutil.is_high_entropy(b) for b in (head, *others))
-    result["small_sample"] = size_small
     if str(result["real_mime"]).startswith("text/"):
         result["embedded_binary"] = any(
             b.rstrip(b"\x00") and textutil.detect_text_encoding(b, partial=True) is None for b in others
@@ -308,7 +349,10 @@ def is_ext_mismatch(
             * .bin·.dat처럼 원래 아무 바이너리나 담는 확장자면 False.
         - 텍스트로 판정됐어도 텍스트 확장자인데 중간·끝 구간에 텍스트가 아닌 데이터가
           있으면 True(텍스트 뒤에 데이터 은닉).
-        - 형식이 판별됐는데 확장자가 없으면, 텍스트는 False(README 등), 그 외는 True.
+        - 확장자가 없으면, 사진·영상·음성·PDF일 때만 True(확장자를 떼어 숨긴 경우).
+          리눅스 실행 파일·텍스트·DB처럼 원래 확장자 없이 흔한 형식은 False.
+        - 이 도구가 모르는 확장자(``KNOWN_EXTS``에 없음, 예: ``libc.so.6``의 ``.6``)면
+          판정할 근거가 없으므로 False("판정 불가").
         - 그 밖에는 허용 확장자 집합에 없으면 True. libmagic이 우리 표에 없는 MIME을
           내놓아 허용 집합이 비면, 내장 판별 결과(``fallback_*``)의 허용 집합을 쓴다.
           그래도 비면 판정할 수 없으므로 False.
@@ -335,11 +379,19 @@ def is_ext_mismatch(
         False
         >>> is_ext_mismatch(".jpg", "application/x-dosexec", ".exe")   # 사진으로 위장한 실행 파일
         True
+        >>> is_ext_mismatch("", "application/x-executable", "")        # 확장자 없는 리눅스 실행 파일
+        False
+        >>> is_ext_mismatch(".cr2", "image/tiff", ".tiff")             # TIFF 구조의 카메라 RAW
+        False
     """
     mime = (real_mime or "").lower()
     d = _normalize_ext(disk_ext)
 
     if mime in EMPTY_MIMES:
+        return False
+    if not d:
+        return mime.startswith(NOEXT_SUSPICIOUS_PREFIXES)
+    if d not in KNOWN_EXTS:
         return False
     if mime in UNKNOWN_BINARY_MIMES:
         return d in SIGNATURE_REQUIRED_EXTS or d in TEXT_FAMILY
@@ -351,8 +403,6 @@ def is_ext_mismatch(
         allowed = _allowed_exts(fallback_mime.lower(), fallback_ext)
     if not allowed:
         return False
-    if not d:
-        return not mime.startswith("text/")
     return d not in allowed
 
 
@@ -373,7 +423,7 @@ def _result(mime: str, ext: str, desc: str, source: str) -> Dict[str, object]:
         ``probe_file_type`` 반환 형식의 딕셔너리.
     """
     return {"real_mime": mime, "real_ext": ext, "description": desc, "source": source,
-            "high_entropy": False, "embedded_binary": False, "small_sample": False,
+            "high_entropy": False, "embedded_binary": False,
             "fallback_mime": "", "fallback_ext": ""}
 
 

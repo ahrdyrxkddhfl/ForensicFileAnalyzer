@@ -6,19 +6,21 @@
 "검색했는데 없음"과 "검색하지 못함"을 구분해야 하기 때문이다.
 
 인코딩 처리 순서:
-    1. BOM이 있으면 BOM이 가리키는 인코딩(UTF-8/16/32)
-    2. 사용자가 지정한 인코딩 목록(기본: UTF-8 → CP949)을 엄격 모드로 시도
-    3. BOM 없는 UTF-16(``textutil.detect_utf16_without_bom``)
-    4. 그래도 안 되면(예: 텍스트 뒤에 바이너리가 붙은 위장 파일) 2번 목록 중
-       파일 앞에서부터 가장 멀리까지 정상 디코딩되는 인코딩을 고르고(비슷하면 목록
-       앞쪽 우선), 깨진 부분만 대체 문자(U+FFFD)로 바꿔 읽는다.
-       ``encoding`` 열에 ``utf-8+replace``처럼 기록된다. 의심 파일일수록 텍스트 부분을
-       검색할 수 있어야 하기 때문이다. UTF-8 대체 모드는 ASCII 바이트를 그대로 두므로,
-       파일 대부분이 바이너리여도 영문·숫자 키워드는 찾을 수 있다.
+    1. 파일 앞부분(64KB)으로 인코딩을 고른다. 시그니처 판별과 **같은 함수**
+       (``textutil.detect_text_encoding``)와 같은 기본 목록(UTF-8 → CP949 → Shift-JIS →
+       GBK → CP1252, BOM, BOM 없는 UTF-16)을 쓰므로, 시그니처에서 텍스트로 인정한
+       파일은 검색에서도 같은 인코딩으로 읽힌다.
+    2. 고른 인코딩으로 파일 전체를 엄격 모드로 디코딩한다. 끝이 잘린 파일처럼 뒤쪽에서
+       실패하면 깨진 부분만 대체 문자(U+FFFD)로 바꿔 읽고 ``utf-16+replace``처럼 기록한다.
+       어떤 경우에도 디코딩 오류로 검색 전체가 멈추지 않는다.
+    3. 앞부분부터 텍스트가 아니면(예: 텍스트 뒤에 바이너리가 붙은 위장 파일) 목록 중
+       파일 앞에서부터 가장 멀리까지 정상 디코딩되는 인코딩으로 대체 모드로 읽는다.
+       UTF-8 대체 모드는 ASCII 바이트를 그대로 두므로, 파일 대부분이 바이너리여도
+       영문·숫자 키워드는 찾을 수 있다.
 
-    기본 목록이 한국어 위주이므로, 일본어·중국어 문서는 ``--encodings utf-8 shift_jis``
-    처럼 직접 지정해야 정확하다. GBK 중국어 문서는 CP949로도 디코딩되어 버리는 경우가
-    있어 자동 판별로는 구분할 수 없다.
+    같은 바이트열이 여러 인코딩으로 동시에 디코딩될 수 있다. 특히 GBK 중국어 문서는
+    CP949로도 디코딩되어 자동으로 구분할 수 없으므로 ``--encodings utf-8 gbk``처럼
+    직접 지정해야 한다.
 """
 from __future__ import annotations
 
@@ -28,9 +30,12 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from . import textutil
-from .inventory import iter_files
+from .inventory import KIND_SYMLINK_CYCLE, iter_files
 
-DEFAULT_ENCODINGS: Tuple[str, ...] = ("utf-8", "cp949")
+# 시그니처 판별과 같은 기본 목록을 쓴다. cp1252는 거의 모든 바이트를 받아들이므로 마지막.
+DEFAULT_ENCODINGS: Tuple[str, ...] = textutil.DEFAULT_LEGACY_ENCODINGS
+# 인코딩을 고를 때 보는 앞부분 크기.
+DETECT_SAMPLE_BYTES = 64 * 1024
 DEFAULT_INCLUDE_EXTS: Tuple[str, ...] = ("txt", "log", "csv", "json", "xml", "md", "ini", "conf", "reg")
 DEFAULT_MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 
@@ -74,6 +79,7 @@ def search_texts(
     case_sensitive: bool = False,
     include_exts: Sequence[str] = DEFAULT_INCLUDE_EXTS,
     exclude_globs: Optional[Iterable[str]] = None,
+    exclude_paths: Optional[Iterable[Union[str, Path]]] = None,
     follow_symlinks: bool = False,
     max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE,
     encodings: Sequence[str] = DEFAULT_ENCODINGS,
@@ -91,13 +97,14 @@ def search_texts(
         case_sensitive: 대소문자 구분 여부.
         include_exts: 검색 대상 확장자(점 없이, 예: ``"txt"``).
         exclude_globs: 제외할 글롭 패턴.
+        exclude_paths: 통째로 제외할 폴더·파일 경로(결과 폴더 등).
         follow_symlinks: 심볼릭 링크를 따라갈지 여부. False면 링크는 건너뛰고 기록한다.
         max_file_size_bytes: 이보다 큰 파일은 건너뛰고 기록한다.
         encodings: BOM이 없을 때 시도할 인코딩 목록. 모듈 설명 참고.
         preview_max_len: 미리보기 최대 길이.
         skipped: 검색하지 못한 파일을 ``{"path", "reason", "size_bytes"}``로 기록할
             리스트. 이유는 ``symlink`` / ``too_large`` / ``read_error`` /
-            ``dir_read_error`` 중 하나다.
+            ``dir_read_error`` / ``symlink_cycle`` 중 하나다.
 
     Returns:
         검색 결과 행 리스트. 열은 ``HIT_FIELDS``다.
@@ -118,7 +125,8 @@ def search_texts(
     rows: List[Dict[str, Union[str, int]]] = []
 
     for fpath, is_link in iter_files(
-        Path(root).resolve(), follow_symlinks=follow_symlinks, exclude_globs=exclude_globs, errors=dir_errors
+        Path(root).resolve(), follow_symlinks=follow_symlinks, exclude_globs=exclude_globs,
+        exclude_paths=exclude_paths, errors=dir_errors,
     ):
         if fpath.suffix.lower().lstrip(".") not in wanted:
             continue
@@ -159,7 +167,8 @@ def search_texts(
 
     if skipped is not None:
         for e in dir_errors:
-            skipped.append({"path": e["path"], "reason": "dir_read_error", "size_bytes": ""})
+            reason = "symlink_cycle" if e.get("kind") == KIND_SYMLINK_CYCLE else "dir_read_error"
+            skipped.append({"path": e["path"], "reason": reason, "size_bytes": ""})
     return rows
 
 
@@ -168,13 +177,15 @@ def decode_text_file(path: Path, *, encodings: Sequence[str] = DEFAULT_ENCODINGS
 
     텍스트 모드로 ``open``만 해서는 디코딩이 일어나지 않고, 읽는 순간 일어난다.
     그래서 바이트를 먼저 전부 읽은 뒤 디코딩한다(호출 측에서 크기 상한을 건다).
+    디코딩 오류로 예외가 나지 않는다. 처리 순서는 모듈 설명을 참고한다.
 
     Args:
         path: 읽을 파일 경로.
-        encodings: BOM이 없을 때 시도할 인코딩 목록.
+        encodings: 시도할 인코딩 목록(우선순위 순).
 
     Returns:
-        ``(줄 리스트, 인코딩 이름)``. 파일을 읽지 못하면 None.
+        ``(줄 리스트, 인코딩 이름)``. 일부를 대체 문자로 읽었으면 인코딩 이름 뒤에
+        ``+replace``가 붙는다. 파일을 읽지 못하면 None.
 
     Example:
         >>> lines, enc = decode_text_file(Path("ForensicTestData/docs/memo_utf16.txt"))
@@ -185,26 +196,17 @@ def decode_text_file(path: Path, *, encodings: Sequence[str] = DEFAULT_ENCODINGS
         raw = path.read_bytes()
     except OSError:
         return None
+    if not raw:
+        return [], "empty"
 
-    bom = textutil.detect_bom_encoding(raw)
-    if bom:
-        return raw.decode(bom).splitlines(keepends=True), bom
-
-    for enc in encodings:
-        try:
-            return raw.decode(enc).splitlines(keepends=True), enc
-        except (UnicodeDecodeError, LookupError):
-            continue
-
-    utf16 = textutil.detect_utf16_without_bom(raw)
-    if utf16:
-        try:
-            return raw.decode(utf16).splitlines(keepends=True), utf16
-        except UnicodeDecodeError:
-            pass
-
-    enc = _pick_encoding_for_broken(raw, encodings)
-    return raw.decode(enc, errors="replace").splitlines(keepends=True), f"{enc}+replace"
+    enc = textutil.detect_text_encoding(raw[:DETECT_SAMPLE_BYTES], legacy_encodings=encodings)
+    if enc is None:
+        enc = _pick_encoding_for_broken(raw, encodings)
+    try:
+        return raw.decode(enc).splitlines(keepends=True), enc
+    except UnicodeDecodeError:
+        # 앞부분은 이 인코딩인데 뒤쪽이 깨진 경우(끝이 잘린 파일, 뒤에 붙은 바이너리 등)
+        return raw.decode(enc, errors="replace").splitlines(keepends=True), f"{enc}+replace"
 
 
 def _valid_prefix_len(raw: bytes, encoding: str) -> int:

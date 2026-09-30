@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import math
 import os
 import random
@@ -26,8 +27,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
-from .foroutput import unescape_formula
+from .foroutput import meta_path_for, unescape_formula
 from .hashing import HASH_CHANGED_DURING, HASH_READ_ERROR, compute_file_hashes
+
+# 기준본과 현재 스캔에서 같아야 하는 스캔 옵션. 다르면 가짜 추가·삭제·크기 변경이 나온다.
+COMPARED_SCAN_OPTIONS: Tuple[str, ...] = ("follow_symlinks", "exclude", "excluded_paths")
 
 # 현재 시각보다 이만큼(초) 이상 미래인 시각은 조작 의심으로 본다(시간대·시계 오차 여유 1일).
 FUTURE_TOLERANCE_SEC = 86400
@@ -348,6 +352,54 @@ def compare_with_baseline(
         if (bl or cl) and bl != cl:
             issues.append(Issue(shown, "LINK_TARGET_CHANGED", "WARN", f"링크 대상 {bl or '(없음)'} → {cl or '(없음)'}",
                                 field="link_target", value=bl))
+    return issues
+
+
+def load_scan_meta(csv_path: Union[str, Path]) -> Optional[Dict[str, object]]:
+    """인벤토리 CSV에 딸린 스캔 정보(``<이름>.meta.json``)를 읽는다.
+
+    Args:
+        csv_path: 인벤토리 CSV 경로.
+
+    Returns:
+        스캔 정보 딕셔너리. 파일이 없거나 JSON이 아니면 None.
+    """
+    try:
+        with open(meta_path_for(Path(csv_path)), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def compare_scan_options(baseline_meta: Optional[Dict[str, object]], current_meta: Dict[str, object]) -> List[Issue]:
+    """기준본을 만들 때와 지금의 스캔 옵션이 같은지 확인한다.
+
+    심볼릭 링크를 따라갔는지, 무엇을 제외했는지가 다르면 실제로는 바뀌지 않은 파일이
+    추가·삭제·크기 변경으로 나온다. 그런 결과를 오해하지 않도록 옵션 차이를 먼저 알린다.
+    기준본 폴더 위치(``root``)는 증거를 옮겨도 비교할 수 있어야 하므로 비교하지 않는다.
+
+    Args:
+        baseline_meta: ``load_scan_meta``로 읽은 기준본 스캔 정보. 없으면 None.
+        current_meta: 지금 스캔의 정보.
+
+    Returns:
+        이슈 리스트. 코드는 ``BASELINE_OPTIONS_DIFFER`` (WARN), ``BASELINE_META_MISSING`` (INFO).
+    """
+    if baseline_meta is None:
+        return [Issue("", "BASELINE_META_MISSING", "INFO",
+                      "기준본의 스캔 정보(.meta.json)가 없어 스캔 옵션이 같은지 확인하지 못함")]
+    issues: List[Issue] = []
+    for key in COMPARED_SCAN_OPTIONS:
+        b, c = baseline_meta.get(key), current_meta.get(key)
+        if isinstance(b, list):
+            b = sorted(map(str, b))
+        if isinstance(c, list):
+            c = sorted(map(str, c))
+        if b != c:
+            issues.append(Issue("", "BASELINE_OPTIONS_DIFFER", "WARN",
+                                f"스캔 옵션 {key}가 기준본과 다름: {b} → {c}. 추가·삭제·크기 변경 결과가 "
+                                "옵션 차이 때문일 수 있음", field=key, value=str(b)))
     return issues
 
 

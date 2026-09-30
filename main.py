@@ -18,27 +18,30 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import datetime
 import hashlib
+import platform
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
-from forensic_analyzer.foroutput import ensure_dir, make_outpath, write_rows_csv
+from forensic_analyzer import __version__
+from forensic_analyzer.foroutput import ensure_dir, make_outpath, meta_path_for, write_json, write_rows_csv
 from forensic_analyzer.hashing import add_hashes_to_rows
-from forensic_analyzer.inventory import INVENTORY_FIELDS, collect_inventory
+from forensic_analyzer.inventory import INVENTORY_FIELDS, KIND_SYMLINK_CYCLE, collect_inventory
 from forensic_analyzer.search import (
     DEFAULT_ENCODINGS, DEFAULT_INCLUDE_EXTS, HIT_FIELDS, SKIP_FIELDS, compile_patterns, search_texts,
 )
 from forensic_analyzer.signature import add_signature_to_rows
 from forensic_analyzer.timeline import TIMELINE_FIELDS, build_timeline_rows
 from forensic_analyzer.validate import (
-    ISSUE_FIELDS, Issue, compare_with_baseline, issues_to_rows, load_inventory_csv,
-    sample_verify_hashes, summarize_issues, validate_inventory_rows,
+    ISSUE_FIELDS, Issue, compare_scan_options, compare_with_baseline, issues_to_rows, load_inventory_csv,
+    load_scan_meta, sample_verify_hashes, summarize_issues, validate_inventory_rows,
 )
 
 SIGNATURE_FIELDS = ("sig_mime", "sig_ext", "sig_desc", "sig_source", "sig_high_entropy", "ext_on_disk", "ext_mismatch")
-ERROR_FIELDS = ("path", "reason")
+ERROR_FIELDS = ("path", "kind", "reason")
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +71,7 @@ def build_inventory(args: argparse.Namespace, errors: List[Dict[str, str]]) -> L
         인벤토리 행 리스트.
     """
     rows = collect_inventory(args.root, follow_symlinks=args.follow_symlinks,
-                             exclude_globs=args.exclude, errors=errors)
+                             exclude_globs=args.exclude, exclude_paths=args.exclude_paths, errors=errors)
     if args.with_hash:
         add_hashes_to_rows(rows, algorithms=tuple(args.hash_algorithms), chunk_size=args.hash_block_size,
                            follow_symlinks=args.follow_symlinks)
@@ -87,21 +90,75 @@ def write_inventory(rows: List[Dict[str, object]], path: Path, args: argparse.Na
     """
     algos = args.hash_algorithms if args.with_hash else []
     write_rows_csv(rows, path, preferred=inventory_fieldnames(algos))
-    print(f"[OK] saved {len(rows)} rows -> {path}")
+    write_json(scan_meta(args, len(rows)), meta_path_for(path))
+    print(f"[OK] saved {len(rows)} rows -> {path} (+ {meta_path_for(path).name})")
+
+
+def scan_meta(args: argparse.Namespace, row_count: int) -> Dict[str, object]:
+    """이번 스캔의 조건을 기록용 딕셔너리로 만든다(인벤토리 CSV 옆에 .meta.json으로 저장).
+
+    나중에 이 인벤토리를 기준본으로 쓸 때 옵션이 같은지 확인하고, 보고서에 "언제·어떤
+    도구 버전·어떤 옵션으로 수집했는지"를 남기기 위한 것이다.
+
+    Args:
+        args: 파싱된 명령줄 인자.
+        row_count: 인벤토리 행 수.
+
+    Returns:
+        도구 버전, 수집 시각(UTC), 루트, 스캔 옵션, 실행 환경을 담은 딕셔너리.
+    """
+    return {
+        "tool": "ForensicFileAnalyzer",
+        "version": __version__,
+        "created_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "command": args.command,
+        "root": str(Path(args.root).resolve()),
+        "follow_symlinks": bool(args.follow_symlinks),
+        "exclude": list(args.exclude),
+        "excluded_paths": list(args.excluded_rel),
+        "hash_algorithms": list(args.hash_algorithms) if args.with_hash else [],
+        "with_signature": bool(args.with_signature),
+        "platform": sys.platform,
+        "python": platform.python_version(),
+        "row_count": row_count,
+    }
 
 
 def report_scan_errors(errors: List[Dict[str, str]], main_out: Path) -> None:
-    """스캔 중 읽지 못한 항목이 있으면 경고를 출력하고 별도 CSV로 저장한다.
+    """스캔 중 기록된 항목을 출력하고 별도 CSV(``<이름>_errors.csv``)로 저장한다.
+
+    읽지 못한 항목(``error``)은 확인하지 못한 것이 있다는 뜻이라 WARN으로, 순환 링크를
+    막은 것(``symlink_cycle``)은 정상 동작이라 INFO로 구분해 알린다.
 
     Args:
-        errors: ``collect_inventory``가 기록한 오류 목록.
-        main_out: 주 결과 파일 경로. 같은 폴더에 ``<이름>_errors.csv``로 저장한다.
+        errors: ``collect_inventory``가 기록한 목록.
+        main_out: 주 결과 파일 경로. 같은 폴더에 저장한다.
     """
     if not errors:
         return
     err_path = main_out.with_name(f"{main_out.stem}_errors.csv")
     write_rows_csv(errors, err_path, preferred=ERROR_FIELDS)
-    print(f"[WARN] {len(errors)} items could not be read -> {err_path}")
+    cycles = sum(1 for e in errors if e.get("kind") == KIND_SYMLINK_CYCLE)
+    if len(errors) - cycles:
+        print(f"[WARN] {len(errors) - cycles} items could not be read -> {err_path}")
+    if cycles:
+        print(f"[INFO] {cycles} symlink cycles skipped -> {err_path}")
+
+
+def scan_notes_to_issues(errors: List[Dict[str, str]]) -> List[Issue]:
+    """스캔 중 기록된 항목을 검증 이슈로 바꾼다.
+
+    Args:
+        errors: ``collect_inventory``가 기록한 목록.
+
+    Returns:
+        읽기 실패는 ``SCAN_ERROR`` (WARN), 순환 링크는 ``SYMLINK_CYCLE_SKIPPED`` (INFO).
+    """
+    return [
+        Issue(e["path"], "SYMLINK_CYCLE_SKIPPED", "INFO", e["reason"]) if e.get("kind") == KIND_SYMLINK_CYCLE
+        else Issue(e["path"], "SCAN_ERROR", "WARN", e["reason"])
+        for e in errors
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +189,8 @@ def cmd_search(args: argparse.Namespace) -> None:
     skipped: List[Dict[str, object]] = []
     hits = search_texts(
         args.root, args.keywords, use_regex=args.regex, case_sensitive=args.case_sensitive,
-        include_exts=tuple(args.include_exts), exclude_globs=args.exclude, follow_symlinks=args.follow_symlinks,
+        include_exts=tuple(args.include_exts), exclude_globs=args.exclude, exclude_paths=args.exclude_paths,
+        follow_symlinks=args.follow_symlinks,
         max_file_size_bytes=int(args.max_size_mb * 1024 * 1024), encodings=tuple(args.encodings), skipped=skipped,
     )
     out_hits = Path(args.out_hits) if args.out_hits else make_outpath("search", ensure_dir(Path(args.out_dir)), args.label)
@@ -178,10 +236,11 @@ def cmd_validate(args: argparse.Namespace) -> None:
 
     algos = tuple(args.hash_algorithms) if args.with_hash else ()
     issues: List[Issue] = validate_inventory_rows(rows, follow_symlinks=args.follow_symlinks, hash_algorithms=algos)
-    issues += [Issue(e["path"], "SCAN_ERROR", "WARN", e["reason"]) for e in errors]
+    issues += scan_notes_to_issues(errors)
     if args.verify_hash:
         issues += sample_verify_hashes(rows, algorithms=algos, chunk_size=args.hash_block_size)
     if args.baseline:
+        issues += compare_scan_options(load_scan_meta(args.baseline), scan_meta(args, len(rows)))
         issues += compare_with_baseline(rows, args.baseline_rows, algorithms=algos)
         print(f"[INFO] compared with baseline: {args.baseline} ({len(args.baseline_rows)} rows)")
 
@@ -335,6 +394,76 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
             args.baseline_rows = load_inventory_csv(args.baseline)
         except ValueError as e:
             parser.error(str(e))
+
+    set_output_exclusions(args)
+
+
+def output_paths(args: argparse.Namespace) -> List[Path]:
+    """이 도구가 읽거나 쓰는 결과 파일·폴더 경로를 모은다.
+
+    Args:
+        args: 파싱된 명령줄 인자.
+
+    Returns:
+        결과 폴더, 명시한 결과 파일과 그 부속 파일(``_errors.csv`` 등), 기준본과 그 스캔 정보.
+    """
+    paths = [Path(args.out_dir)]
+    for name in ("out", "out_hits", "out_timeline", "out_issues", "out_inventory", "baseline"):
+        value = getattr(args, name, "")
+        if value:
+            f = Path(value)
+            paths += [f, meta_path_for(f), f.with_name(f"{f.stem}_errors.csv"), f.with_name(f"{f.stem}_skipped.csv")]
+    return paths
+
+
+def set_output_exclusions(args: argparse.Namespace) -> None:
+    """스캔 대상 안에 있는 결과 폴더·파일을 스캔에서 제외하도록 설정한다.
+
+    결과 폴더 기본값이 현재 폴더의 ``outputs``라서, 루트를 ``.``로 주면 이전 결과 CSV가
+    인벤토리에 섞인다. 그러면 기준본 비교에서 가짜 추가·삭제가 나온다. 결과 폴더가
+    루트 자체이거나 루트를 포함하면 폴더 전체를 뺄 수 없으므로 경고만 한다.
+
+    스캔 정보(.meta.json)에는 결과 **폴더**만 기록한다. 결과 파일이나 기준본은 기준본을
+    만들 때는 아직 없던 파일이라, 기록하면 매번 "옵션이 다름"으로 잘못 나오기 때문이다.
+
+    Args:
+        args: 파싱된 명령줄 인자. ``exclude_paths``(절대 경로 목록)와 ``excluded_rel``
+            (결과 폴더의 루트 기준 상대 경로, 스캔 정보 기록용)이 추가된다.
+    """
+    root = Path(args.root).resolve()
+    out_dir = Path(args.out_dir)
+    args.exclude_paths, args.excluded_rel = [], []
+    for path in output_paths(args):
+        target = path.resolve()
+        if _is_under(root, target):  # 결과 경로가 루트 자체이거나 루트를 품고 있음
+            if path == out_dir:
+                print(f"[WARN] 결과 폴더가 스캔 루트를 포함해 이전 결과가 섞일 수 있습니다: {args.out_dir}")
+            continue
+        if _is_under(target, root):
+            args.exclude_paths.append(str(target))
+            if path == out_dir:
+                args.excluded_rel.append(target.relative_to(root).as_posix())
+    if args.exclude_paths:
+        shown = [Path(p).relative_to(root).as_posix() for p in args.exclude_paths if Path(p).exists()]
+        if shown:
+            print(f"[INFO] 스캔 대상 안의 결과 파일·폴더는 제외: {', '.join(shown)}")
+
+
+def _is_under(path: Path, parent: Path) -> bool:
+    """``path``가 ``parent`` 폴더 안(또는 같은 경로)에 있는지 확인한다(Python 3.9 호환).
+
+    Args:
+        path: 확인할 경로(절대 경로).
+        parent: 기준 폴더(절대 경로).
+
+    Returns:
+        안에 있으면 True.
+    """
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
 
 
 def main(argv: Sequence[str] | None = None) -> None:

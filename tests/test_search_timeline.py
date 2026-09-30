@@ -24,10 +24,26 @@ def test_encodings(write, tmp_path: Path) -> None:
                        "u16nobom_noascii.txt": "utf-16-le"}
 
 
-def test_user_encodings_for_japanese(write, tmp_path: Path) -> None:
-    write("jp.txt", "パスワード変更\n".encode("shift_jis"))
-    assert not search_texts(tmp_path, ["パスワード"])
-    assert search_texts(tmp_path, ["パスワード"], encodings=("utf-8", "shift_jis"))
+def test_japanese_found_by_default_like_signature(write, tmp_path: Path) -> None:
+    """시그니처가 텍스트로 인정하는 인코딩(Shift-JIS)은 검색 기본값으로도 찾아야 한다."""
+    write("jp.txt", "パスワード変更\n".encode("shift_jis") * 20)
+    hits = search_texts(tmp_path, ["パスワード"])
+    assert len(hits) == 20 and hits[0]["encoding"] == "shift_jis"
+
+
+def test_gbk_needs_explicit_encoding(write, tmp_path: Path) -> None:
+    """GBK는 CP949로도 디코딩되어 자동 구분이 안 되므로, 지정하면 찾을 수 있어야 한다."""
+    write("zh.txt", "密码修改请求\n".encode("gbk") * 20)
+    assert search_texts(tmp_path, ["密码"], encodings=("utf-8", "gbk"))
+
+
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-8-sig", "utf-16-le", "utf-8"])
+def test_truncated_file_does_not_crash(write, tmp_path: Path, encoding: str) -> None:
+    """끝이 잘린 파일 하나 때문에 검색 전체가 멈추면 안 된다."""
+    write("cut.txt", ("비밀번호 확인\n" * 20).encode(encoding)[:-1])
+    write("ok.txt", "비밀번호 정상\n".encode("utf-8"))
+    hits = search_texts(tmp_path, ["비밀번호"])
+    assert {Path(h["path"]).name for h in hits} == {"cut.txt", "ok.txt"}
 
 
 def test_partially_broken_file_is_still_searched(write, tmp_path: Path, rng: random.Random) -> None:

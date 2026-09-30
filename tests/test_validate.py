@@ -141,14 +141,22 @@ def test_formula_like_filenames_roundtrip(tmp_path: Path) -> None:
     root.mkdir()
     (root / "=HYPERLINK(1).txt").write_bytes(b"x")
     (root / "-note.txt").write_bytes(b"y")
+    (root / "'=quoted.txt").write_bytes(b"")          # 원래부터 작은따옴표로 시작하는 이름
+    (root / "''double.txt").write_bytes(b"w")
     rows = _inv(root)
     csv_path = tmp_path / "b.csv"
     write_rows_csv(rows, csv_path)
     raw = csv_path.read_text(encoding="utf-8-sig")
     assert "'=HYPERLINK" in raw and "'-note" in raw
     base = load_inventory_csv(csv_path)
-    assert {r["name"] for r in base} == {"=HYPERLINK(1).txt", "-note.txt"}
+    assert {r["name"] for r in base} == {"=HYPERLINK(1).txt", "-note.txt", "'=quoted.txt", "''double.txt"}
     assert compare_with_baseline(_inv(root), base) == []
+
+
+@pytest.mark.parametrize("value", ["=x", "'=y", "''z", "'", "-1.5", "-abc", "@a", "normal", "", "'5"])
+def test_formula_escape_roundtrip(value: str) -> None:
+    from forensic_analyzer.foroutput import escape_formula, unescape_formula
+    assert unescape_formula(escape_formula(value)) == value
 
 
 def test_inventory_validation_codes(case: Path) -> None:
