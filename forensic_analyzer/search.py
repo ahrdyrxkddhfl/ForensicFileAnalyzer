@@ -13,8 +13,11 @@
     2. 고른 인코딩이 UTF-8(또는 UTF-16·UTF-32)이면 파일 전체를 엄격 모드로 디코딩한다.
        성공하면 끝이다.
     3. 실패했거나, 고른 인코딩이 CP949 같은 레거시 인코딩이면 **줄 단위로** 읽는다.
-       줄마다 UTF-8 → (1번에서 고른 인코딩) → 나머지 목록 순서로 시도한다. 단 CP1252처럼
-       거의 모든 바이트를 받아들이는 인코딩은 앞으로 당기지 않고 항상 마지막에 시도한다.
+       줄마다 UTF-8 → (파일의 대표 레거시 인코딩) → 나머지 목록 순서로 시도한다.
+       대표 레거시 인코딩은 **UTF-8로 읽히지 않는 줄만 모아서** 판정한다. 파일 전체로 판정하면
+       UTF-8 줄이 섞여 CP949 판정이 실패하고, CP949 한글도 받아들이는 GBK가 대신 뽑혀
+       CP949 줄을 중국어로 잘못 읽기 때문이다. CP1252처럼 거의 모든 바이트를 받아들이는
+       인코딩은 앞으로 당기지 않고 항상 마지막에 시도한다.
        레거시 인코딩을 파일 전체에 바로 적용하지 않는 이유는, CP949가 UTF-8 한글 바이트도
        엉뚱한 글자로 "성공적으로" 읽어 버려서, UTF-8 줄이 섞인 파일에서 그 줄들을 놓치기
        때문이다. 처음 성공한 인코딩을 그 줄의 인코딩으로 기록하고, 어떤 인코딩으로도
@@ -31,6 +34,11 @@
        바이트도 엉뚱한 글자로 받아들이는 경우가 많다).
     4. UTF-16·UTF-32는 줄바꿈 바이트가 달라 줄 단위로 나눌 수 없으므로, 2번이 실패하면
        깨진 부분만 대체 문자로 읽는다. 어떤 경우에도 디코딩 오류로 검색이 멈추지 않는다.
+
+줄 번호:
+    줄은 편집기와 같게 ``\\n``, ``\\r\\n``, ``\\r``에서만 나눈다. 파이썬의 ``str.splitlines()``는
+    폼피드(``\\x0c``)나 ``\\u2028`` 등에서도 줄을 나눠, 인쇄용 로그처럼 폼피드가 들어간 파일에서
+    줄 번호가 실제보다 밀리기 때문이다.
 
     같은 바이트열이 여러 인코딩으로 동시에 디코딩될 수 있다. 특히 GBK 중국어 문서는
     CP949로도 디코딩되어 자동으로 구분할 수 없으므로 ``--encodings utf-8 gbk``처럼
@@ -50,6 +58,9 @@ from .inventory import KIND_SYMLINK_CYCLE, iter_files
 DEFAULT_ENCODINGS: Tuple[str, ...] = textutil.DEFAULT_LEGACY_ENCODINGS
 # 인코딩을 고를 때 보는 앞부분 크기.
 DETECT_SAMPLE_BYTES = 64 * 1024
+# 줄 나누기: 편집기처럼 \r\n, \n, \r에서만 나눈다(줄바꿈 문자를 줄 끝에 포함).
+_LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\n|\r)|[^\r\n]+\Z")
+
 # 거의 모든 바이트를 받아들이는 인코딩. 줄 단위로 읽을 때 앞으로 당기지 않고 항상 마지막에 둔다.
 CATCH_ALL_ENCODINGS = frozenset({"cp1252", "latin-1", "latin1", "iso-8859-1"})
 DEFAULT_INCLUDE_EXTS: Tuple[str, ...] = ("txt", "log", "csv", "json", "xml", "md", "ini", "conf", "reg")
@@ -243,15 +254,66 @@ def decode_text_lines(path: Path, *, encodings: Sequence[str] = DEFAULT_ENCODING
     enc = textutil.detect_text_encoding(raw[:DETECT_SAMPLE_BYTES], legacy_encodings=encodings)
     if enc is not None and enc.startswith(("utf-8", "utf-16", "utf-32")):
         try:
-            return [(line, enc) for line in raw.decode(enc).splitlines(keepends=True)]
+            return [(line, enc) for line in split_lines(raw.decode(enc))]
         except UnicodeDecodeError:
             pass
     if enc is not None and enc.startswith(("utf-16", "utf-32")):
         text = raw.decode(enc, errors="replace")
-        return [(line, f"{enc}+replace") for line in text.splitlines(keepends=True)]
+        return [(line, f"{enc}+replace") for line in split_lines(text)]
 
-    base = enc or _pick_encoding_for_broken(raw, encodings)
-    return _decode_per_line(raw, base, encodings)
+    return _decode_per_line(raw, _legacy_base_encoding(raw, encodings), encodings)
+
+
+def split_lines(text: str) -> List[str]:
+    """문자열을 편집기와 같은 기준(``\\r\\n``, ``\\n``, ``\\r``)으로 나눈다. 줄바꿈 문자는 줄 끝에 남긴다.
+
+    Args:
+        text: 나눌 문자열.
+
+    Returns:
+        줄 리스트. 빈 문자열이면 빈 리스트.
+
+    Example:
+        >>> split_lines("a\\x0cb\\nc\\r\\nd")
+        ['a\\x0cb\\n', 'c\\r\\n', 'd']
+    """
+    return _LINE_RE.findall(text)
+
+
+def _legacy_base_encoding(raw: bytes, encodings: Sequence[str]) -> str:
+    """UTF-8로 읽히지 않는 줄만 모아 파일의 대표 레거시 인코딩을 판정한다.
+
+    UTF-8 줄과 CP949 줄이 섞인 파일을 통째로 판정하면, UTF-8 줄 때문에 CP949 디코딩이
+    실패하고 CP949 한글도 받아들이는 GBK가 대신 뽑힌다. UTF-8이 아닌 줄만 보면 CP949
+    줄만 남으므로 정확히 판정된다.
+
+    Args:
+        raw: 파일 바이트.
+        encodings: 시도할 인코딩 목록.
+
+    Returns:
+        대표 레거시 인코딩. 판정하지 못하면 앞에서부터 가장 멀리 정상 디코딩되는 인코딩.
+
+    Example:
+        >>> mixed = ("A 비밀번호\\n".encode("utf-8") + "B 비밀번호\\n".encode("cp949")) * 5
+        >>> _legacy_base_encoding(mixed, ["utf-8", "cp949", "gbk"])
+        'cp949'
+    """
+    sample = bytearray()
+    for chunk in raw.splitlines(keepends=True):
+        try:
+            chunk.decode("utf-8")
+        except UnicodeDecodeError:
+            sample += chunk
+            if len(sample) >= DETECT_SAMPLE_BYTES:
+                break
+    legacy = [e for e in encodings if e.lower().replace("_", "-") not in ("utf-8", "utf8")]
+    if sample and legacy:
+        enc = textutil.detect_text_encoding(bytes(sample), legacy_encodings=legacy)
+        if enc is not None and not enc.startswith(("utf-16", "utf-32")):
+            return enc
+        return _pick_encoding_for_broken(bytes(sample), legacy)
+    return _pick_encoding_for_broken(raw, encodings)
 
 
 def _decode_per_line(raw: bytes, base: str, encodings: Sequence[str]) -> List[Tuple[str, str]]:

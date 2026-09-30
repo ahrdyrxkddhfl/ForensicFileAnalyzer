@@ -107,6 +107,77 @@ def printable_ratio(text: str) -> float:
     return ok / len(text)
 
 
+# 한 레거시 인코딩으로 디코딩은 됐지만 결과가 어색하면(다른 인코딩의 글자를 잘못 읽은
+# 흔적) 그 인코딩을 보류하고 다음 후보를 먼저 본다. 아래 비율을 넘으면 어색하다고 본다.
+IMPLAUSIBLE_RATIO = 0.3
+# 위 어색함 검사가 있는 인코딩. 앞선 인코딩을 보류했을 때, 이 검사를 통과한 인코딩만
+# 그 자리를 대신할 수 있다(검사가 없는 GBK·CP1252는 거의 모든 바이트를 받아들이므로
+# 대신 뽑히면 오히려 틀릴 가능성이 크다).
+_CHECKED_ENCODINGS = frozenset({"cp949", "euc-kr", "uhc", "shift-jis", "sjis", "cp932"})
+
+
+def _is_ks_x_1001_hangul(ch: str) -> bool:
+    """한글 음절이 KS X 1001 상용 한글 2,350자에 속하는지 확인한다.
+
+    Args:
+        ch: 한글 음절 한 글자.
+
+    Returns:
+        CP949로 바꾼 두 바이트가 상용 한글 영역(0xB0~0xC8, 0xA1~0xFE)이면 True.
+
+    Example:
+        >>> _is_ks_x_1001_hangul("가"), _is_ks_x_1001_hangul("똠")
+        (True, False)
+    """
+    try:
+        b = ch.encode("cp949")
+    except UnicodeEncodeError:
+        return False
+    return len(b) == 2 and 0xB0 <= b[0] <= 0xC8 and 0xA1 <= b[1] <= 0xFE
+
+
+def _looks_misdecoded(text: str, encoding: str) -> bool:
+    """레거시 인코딩으로 디코딩한 결과가 다른 인코딩을 잘못 읽은 것처럼 보이는지 확인한다.
+
+    같은 바이트가 여러 인코딩으로 동시에 디코딩되는 경우를 가려내기 위한 검사다.
+
+    - CP949: 일본어 Shift-JIS 바이트를 CP949로 읽으면 ``듖뿚롌``처럼 거의 안 쓰는 한글이
+      나온다. 실제 한국어 문서는 대부분 KS X 1001 상용 한글 2,350자 안에서 쓰이므로, 한글 중
+      그 밖의 글자 비율이 높으면 어색하다고 본다. 상용 한글은 CP949에서 첫 바이트가
+      0xB0~0xC8, 둘째 바이트가 0xA1~0xFE인 영역에 정확히 들어간다. (파이썬의 ``euc-kr``
+      인코더는 그 밖의 글자도 8바이트 조합형으로 표현해 버려서 판별에 쓸 수 없다.)
+    - Shift-JIS: 한국어 CP949 바이트를 Shift-JIS로 읽으면 반각 가타카나(``ｱ``~``ﾟ``)가
+      많이 나온다. 실제 일본어 문서에서 반각 가타카나는 드물다.
+
+    Args:
+        text: 디코딩한 문자열.
+        encoding: 사용한 인코딩 이름.
+
+    Returns:
+        어색하면 True. 해당 인코딩에 대한 검사가 없으면 False.
+
+    Example:
+        >>> _looks_misdecoded("管理者 ログイン".encode("shift_jis").decode("cp949"), "cp949")
+        True
+        >>> _looks_misdecoded("관리자 로그인 실패", "cp949")
+        False
+    """
+    enc = encoding.lower().replace("_", "-")
+    if enc in ("cp949", "euc-kr", "uhc"):
+        hangul = [ch for ch in text if 0xAC00 <= ord(ch) <= 0xD7A3]
+        if not hangul:
+            return False
+        rare = sum(1 for ch in hangul if not _is_ks_x_1001_hangul(ch))
+        return rare / len(hangul) > IMPLAUSIBLE_RATIO
+    if enc in ("shift-jis", "sjis", "cp932"):
+        non_ascii = [ch for ch in text if ord(ch) > 0x7F]
+        if not non_ascii:
+            return False
+        halfwidth = sum(1 for ch in non_ascii if 0xFF61 <= ord(ch) <= 0xFF9F)
+        return halfwidth / len(non_ascii) > IMPLAUSIBLE_RATIO
+    return False
+
+
 def _cjk_ratio(text: str) -> float:
     """문자열 중 한중일 문자(한글·한자·가나·전각 등)의 비율을 계산한다.
 
@@ -341,9 +412,11 @@ def detect_text_encoding(
     ASCII 바이트를 UTF-16으로 억지로 읽으면 출력 가능한 한자처럼 보이기 때문에
     이 순서가 중요하다.
 
-    같은 바이트열이 여러 인코딩으로 동시에 디코딩될 수 있다(예: GBK 중국어 문서가
-    CP949로도 디코딩됨). 이 함수의 목적은 "텍스트인가"를 가리는 것이며, 반환한
-    인코딩이 원래 인코딩이라고 보장하지는 않는다.
+    같은 바이트열이 여러 인코딩으로 동시에 디코딩될 수 있다(예: 일본어 Shift-JIS 문서가
+    CP949로도 디코딩됨). 그래서 디코딩 결과가 어색한 인코딩(``_looks_misdecoded``)은
+    보류하고 다음 후보를 먼저 본 뒤, 더 나은 후보가 없을 때만 쓴다. 그래도 GBK 중국어처럼
+    CP949와 구분할 근거가 없는 경우가 있어, 반환한 인코딩이 원래 인코딩이라고 보장하지는
+    않는다. 이 함수의 1차 목적은 "텍스트인가"를 가리는 것이다.
 
     Args:
         buf: 검사할 바이트열(파일 앞부분 또는 중간 구간).
@@ -371,10 +444,19 @@ def detect_text_encoding(
 
     legacy = _NUL_RUN.sub(b"", body)
     if legacy and legacy.count(0) / len(legacy) <= MAX_LEGACY_NUL_RATIO:
+        deferred: Optional[str] = None
         for enc in legacy_encodings:
             text = decode_tolerant(legacy, enc, trim_start=start)
             need = STRICT_PRINTABLE_RATIO.get(enc, MIN_PRINTABLE_RATIO)
-            if text is not None and printable_ratio(text) >= need:
-                return enc
+            if text is None or printable_ratio(text) < need:
+                continue
+            if _looks_misdecoded(text, enc):
+                deferred = deferred or enc   # 어색하면 보류하고 다음 후보를 먼저 본다
+                continue
+            if deferred and enc.lower().replace("_", "-") not in _CHECKED_ENCODINGS:
+                return deferred              # 검증 수단이 없는 후보에게는 자리를 넘기지 않는다
+            return enc
+        if deferred:
+            return deferred
 
     return detect_utf16_without_bom(body, partial=partial)

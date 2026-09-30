@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from conftest import can_symlink
-from forensic_analyzer.search import search_texts
+from forensic_analyzer.search import decode_text_lines, search_texts, split_lines
 from forensic_analyzer.timeline import build_timeline_rows, resolve_tzinfo
 
 
@@ -87,6 +87,51 @@ def test_mixed_utf8_and_cp949_lines(write, tmp_path: Path) -> None:
     write("mixed.log", "앞 비밀번호 A\n".encode("utf-8") * 10 + "뒤 비밀번호 B\n".encode("cp949") * 10)
     hits = search_texts(tmp_path, ["비밀번호"])
     assert [h["encoding"] for h in hits] == ["utf-8"] * 10 + ["cp949"] * 10
+
+
+@pytest.mark.parametrize("repeat", [1, 3000])
+def test_interleaved_utf8_and_cp949_lines(write, tmp_path: Path, repeat: int) -> None:
+    """4차 리뷰 재현: 줄이 번갈아 섞이면 파일 전체 판정이 GBK가 되어 CP949 줄을 중국어로 읽었다."""
+    write("mixed.log", ("A 비밀번호 utf8\n".encode("utf-8") + "B 비밀번호 cp949\n".encode("cp949")) * repeat)
+    hits = search_texts(tmp_path, ["비밀번호"])
+    assert len(hits) == 2 * repeat
+    assert {h["encoding"] for h in hits} == {"utf-8", "cp949"}
+
+
+KO_WORDS = ["비밀번호", "유출", "계좌", "송금", "로그인 실패", "관리자", "사건 번호", "밀", "뷁", "똠방각하", "햏"]
+JA_WORDS = ["パスワード", "送金", "削除", "管理者", "ログイン失敗", "通話記録"]
+ASCII_WORDS = ["INFO ok", "ERROR fail", "user=admin", "[2026-09-30 10:00:00]", "x"]
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_random_mixed_encoding_logs_decode_exactly(tmp_path: Path, seed: int) -> None:
+    """무작위로 섞은 UTF-8·레거시(CP949 또는 Shift-JIS) 줄이 모두 원문과 똑같이 읽혀야 한다.
+
+    예시 몇 개가 아니라 섞는 비율·줄 수·줄바꿈 종류·앞쪽 영문 길이를 무작위로 바꿔 검사한다.
+    (개발 중에는 같은 검사를 2,000개 파일로 돌려 실패 0건을 확인했다.)
+    """
+    rng = random.Random(seed)
+    legacy, words = (("cp949", KO_WORDS), ("shift_jis", JA_WORDS))[seed % 2]
+    p_utf8 = rng.random()
+    lines, raw = [], bytearray()
+    if rng.random() < 0.3:
+        pre = "[2026-09-30] INFO heartbeat ok\n" * rng.randint(100, 3000)
+        lines += split_lines(pre)
+        raw += pre.encode()
+    for _ in range(rng.randint(1, 300)):
+        text = " ".join(rng.choice(words + ASCII_WORDS) for _ in range(rng.randint(1, 6))) + rng.choice(["\n", "\r\n"])
+        lines.append(text)
+        raw += text.encode("utf-8" if rng.random() < p_utf8 else legacy)
+    f = tmp_path / "random.log"
+    f.write_bytes(bytes(raw))
+    assert [line for line, _ in decode_text_lines(f)] == lines
+
+
+def test_line_numbers_ignore_formfeed(write, tmp_path: Path) -> None:
+    """폼피드(\\x0c) 등은 줄바꿈이 아니다. 편집기와 같은 줄 번호가 나와야 한다."""
+    write("ff.log", b"line1\x0cpage\x1cx\nline2 needle\nline3 needle\n")
+    assert [h["line_no"] for h in search_texts(tmp_path, ["needle"])] == [2, 3]
+    assert split_lines("a\x0cb\u2028c\nd\r\ne\rf") == ["a\x0cb\u2028c\n", "d\r\n", "e\r", "f"]
 
 
 def test_multiple_matches_in_one_line(write, tmp_path: Path) -> None:

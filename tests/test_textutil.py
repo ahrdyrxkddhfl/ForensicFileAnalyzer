@@ -73,6 +73,15 @@ def test_utf16_byte_order_is_correct(enc: str, text: str) -> None:
     assert T.detect_utf16_without_bom((text * 40).encode(enc)) == enc
 
 
+def test_similar_legacy_encodings_are_told_apart() -> None:
+    """같은 바이트가 CP949와 Shift-JIS로 모두 디코딩될 때 어색한 쪽을 피해야 한다."""
+    assert T.detect_text_encoding("送金\n".encode("shift_jis")) == "shift_jis"
+    assert T.detect_text_encoding(("管理者 ログイン失敗\n" * 5).encode("shift_jis")) == "shift_jis"
+    assert T.detect_text_encoding(("비밀번호 변경 요청\n" * 5).encode("cp949")) == "cp949"
+    # 희귀 음절이 많은 한국어라도 GBK처럼 검증 수단이 없는 인코딩에 자리를 넘기면 안 된다
+    assert T.detect_text_encoding(("뷁 똠방각하 햏\n" * 20).encode("cp949")) == "cp949"
+
+
 def test_partial_window_is_detected() -> None:
     data = ("비밀번호 변경 요청 " * 500).encode("utf-8")
     assert T.detect_text_encoding(data[1001:9193], partial=True) is not None
