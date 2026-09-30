@@ -196,39 +196,61 @@ def _compile_patterns(
     return patterns
 
 
+# BOM으로 인코딩이 확정되는 경우. UTF-32 LE BOM(FF FE 00 00)은 UTF-16 LE BOM(FF FE)을
+# 포함하므로 반드시 먼저 검사한다.
+_BOM_ENCODINGS: Tuple[Tuple[bytes, str], ...] = (
+    (b"\xff\xfe\x00\x00", "utf-32"),
+    (b"\x00\x00\xfe\xff", "utf-32"),
+    (b"\xef\xbb\xbf", "utf-8-sig"),
+    (b"\xff\xfe", "utf-16"),
+    (b"\xfe\xff", "utf-16"),
+)
+
+
 def _open_text_lines(
     path: Path,
     *,
     encodings: Sequence[str],
 ) -> Optional[Tuple[List[str], str]]:
-    """파일 전체를 후보 인코딩 순서대로 디코딩해 라인 목록과 사용 인코딩을 반환한다.
+    """파일 전체를 디코딩해 라인 목록과 실제로 사용한 인코딩을 반환한다.
 
-    파일을 텍스트 모드로 ``open``만 해서는 디코딩이 일어나지 않는다. 디코딩은
-    실제로 읽는 순간 일어나므로, open 단계에서 예외를 기다리는 방식으로는
-    다음 인코딩으로 넘어갈 수 없다. 그래서 바이트를 먼저 전부 읽은 뒤
-    인코딩별로 ``decode``를 시도한다. 호출 측에서 파일 크기 상한을 이미
-    걸고 있으므로 전체를 메모리에 올려도 된다.
+    파일을 텍스트 모드로 ``open``만 해서는 디코딩이 일어나지 않고, 실제로 읽는
+    순간 일어난다. 그래서 open 단계의 예외로는 다음 인코딩으로 넘어갈 수 없으므로
+    바이트를 먼저 전부 읽은 뒤 디코딩한다. 호출 측에서 파일 크기 상한을 걸고
+    있으므로 전체를 메모리에 올려도 된다.
+
+    디코딩 순서:
+        1. BOM이 있으면 BOM이 가리키는 인코딩(UTF-8/16/32)을 쓴다.
+           윈도우 메모장의 "유니코드" 저장, 레지스트리 내보내기(.reg)가 UTF-16이다.
+        2. BOM이 없으면 ``encodings``를 앞에서부터 시도한다.
+        3. 모두 실패하면 첫 인코딩을 ``errors="replace"``로 쓰고 ``+replace``를 붙인다.
+           기본값처럼 ``latin-1``이 목록에 있으면 latin-1은 모든 바이트를 디코딩하므로
+           3번까지 가지 않는다.
 
     Args:
         path: 읽을 텍스트 파일 경로.
-        encodings: 순서대로 시도할 인코딩 목록. 앞쪽일수록 우선한다.
-            ``latin-1``은 모든 바이트를 디코딩하므로 마지막에 두어야 한다.
+        encodings: BOM이 없을 때 순서대로 시도할 인코딩 목록.
 
     Returns:
         ``(라인 리스트, 사용한 인코딩)`` 튜플. 파일을 읽지 못하면 None.
-        모든 후보가 실패하면 첫 인코딩을 ``errors="replace"``로 사용하고
-        인코딩 이름 뒤에 ``+replace``를 붙여 손실 가능성을 기록한다.
 
     Example:
-        >>> lines, enc = _open_text_lines(Path("cp949_memo.txt"),
+        >>> lines, enc = _open_text_lines(Path("unicode_memo.txt"),
         ...                               encodings=("utf-8", "cp949"))
         >>> enc
-        'cp949'
+        'utf-16'
     """
     try:
         raw = path.read_bytes()
     except OSError:
         return None
+
+    for bom, enc in _BOM_ENCODINGS:
+        if raw.startswith(bom):
+            try:
+                return raw.decode(enc).splitlines(keepends=True), enc
+            except UnicodeDecodeError:
+                break  # BOM만 흉내 낸 깨진 파일이면 일반 순서로 넘어간다.
 
     for enc in encodings:
         try:

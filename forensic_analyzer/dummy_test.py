@@ -100,6 +100,13 @@ def main():
     write_text(docs / "meta.json", json.dumps({"case_id": 123, "owner": "alice"}, ensure_ascii=False, indent=2))
     write_text(logs / "app.log", "[2025-10-04 21:00:00] INFO start\n[2025-10-04 21:01:00] ERROR oops\n")
 
+    # 한글 인코딩 검색 검증용 (UTF-8이 아닌 한글 문서)
+    write(docs / "memo_cp949.txt", "업무 메모\n비밀번호 변경 요청\n".encode("cp949"))   # 메모장 ANSI 저장
+    write(docs / "memo_utf16.txt", "업무 메모\n비밀번호 초기화\n".encode("utf-16"))    # 메모장 유니코드 저장
+
+    # 확장자 위장 검증용: 텍스트 확장자인데 내용은 무작위 바이트(암호화 파일 은닉 흉내)
+    write(docs / "secret.txt", rand_bytes(4096))
+
     # 압축파일
     make_zip(bins / "archive.zip", {
         "inner/readme.txt": b"This is inside zip\n",

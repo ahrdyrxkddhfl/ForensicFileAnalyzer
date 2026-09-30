@@ -33,6 +33,13 @@ except Exception:  # ImportError, 또는 libmagic 공유 라이브러리 로드 
 # 헤더 판별에 읽을 바이트 수. 텍스트/바이너리 휴리스틱에도 같은 버퍼를 쓴다.
 _HEADER_READ_BYTES = 8192
 
+# 텍스트 파일 앞의 BOM. UTF-16/32 텍스트는 NUL 바이트를 포함하므로 BOM으로 먼저 걸러낸다.
+_TEXT_BOMS: Tuple[bytes, ...] = (
+    b"\xef\xbb\xbf",          # UTF-8
+    b"\xff\xfe", b"\xfe\xff",  # UTF-16 LE/BE (UTF-32 LE도 FF FE로 시작)
+    b"\x00\x00\xfe\xff",      # UTF-32 BE
+)
+
 # (오프셋, 매직 바이트, MIME, 대표 확장자) 표. 긴 시그니처를 먼저 둬서 오판을 줄인다.
 _SIGNATURES: Tuple[Tuple[int, bytes, str, str], ...] = (
     (0, b"\x89PNG\r\n\x1a\n", "image/png", ".png"),
@@ -49,29 +56,51 @@ _SIGNATURES: Tuple[Tuple[int, bytes, str, str], ...] = (
     (0, b"\x1f\x8b", "application/gzip", ".gz"),
 )
 
+# 내부 구조가 ZIP / OLE(복합 문서)인 형식 묶음. 한컴 HWP(5.x)는 OLE, HWPX는 ZIP이다.
+_ZIP_FAMILY: FrozenSet[str] = frozenset({
+    ".zip", ".docx", ".xlsx", ".pptx", ".docm", ".xlsm", ".pptm",
+    ".odt", ".ods", ".odp", ".hwpx", ".epub", ".jar", ".apk", ".aar", ".ipa",
+})
+_OLE_FAMILY: FrozenSet[str] = frozenset({".doc", ".xls", ".ppt", ".msg", ".hwp", ".msi"})
+
 # 같은 컨테이너 형식을 공유해서 "불일치"로 보면 안 되는 확장자 묶음.
 # 예: DOCX·XLSX·APK·IPA는 내부 구조가 전부 ZIP이다.
 _TEXT_FAMILY: FrozenSet[str] = frozenset({
+    # 문서·데이터
     ".txt", ".log", ".csv", ".tsv", ".json", ".xml", ".md",
-    ".ini", ".conf", ".cfg", ".yaml", ".yml",
+    ".ini", ".conf", ".cfg", ".yaml", ".yml", ".toml", ".srt", ".vtt",
+    # 웹·스크립트·소스 코드(내용이 전부 일반 텍스트)
+    ".html", ".css", ".js", ".ts", ".py", ".sh", ".bat", ".ps1",
+    ".sql", ".java", ".kt", ".c", ".h", ".cpp", ".go", ".rs", ".rb", ".php",
 })
 _EXTRA_ALLOWED_EXTS: Dict[str, FrozenSet[str]] = {
     "text/plain": _TEXT_FAMILY,
-    "application/zip": frozenset({
-        ".zip", ".docx", ".xlsx", ".pptx", ".jar", ".apk", ".ipa", ".odt",
-    }),
+    "application/zip": _ZIP_FAMILY,
     "application/vnd.sqlite3": frozenset({".sqlite", ".sqlite3", ".db"}),
     "application/x-sqlite3": frozenset({".sqlite", ".sqlite3", ".db"}),
-    "application/x-ole-storage": frozenset({".doc", ".xls", ".ppt", ".msg"}),
-    "application/cdfv2": frozenset({".doc", ".xls", ".ppt", ".msg"}),
+    "application/x-ole-storage": _OLE_FAMILY,
+    "application/cdfv2": _OLE_FAMILY,
+    "application/vnd.ms-office": _OLE_FAMILY,
+    "application/x-hwp": frozenset({".hwp"}),
     "application/x-bplist": frozenset({".plist"}),
     "image/jpeg": frozenset({".jpg"}),
 }
 
-# 형식을 확정할 수 없어 불일치 판정을 하지 않는 MIME.
-_UNDETERMINED_MIMES: FrozenSet[str] = frozenset({
-    "", "application/octet-stream", "inode/x-empty", "application/x-empty",
-})
+# 빈 파일. 내용이 없으므로 어떤 확장자와도 모순되지 않는다.
+_EMPTY_MIMES: FrozenSet[str] = frozenset({"inode/x-empty", "application/x-empty"})
+
+# 시그니처로 형식을 확정하지 못한 경우(알 수 없는 바이너리).
+_UNKNOWN_BINARY_MIMES: FrozenSet[str] = frozenset({"", "application/octet-stream"})
+
+# 정상 파일이라면 반드시 식별 가능한 내용(텍스트 또는 알려진 시그니처)을 갖는 확장자.
+# 이 확장자인데 내용이 "알 수 없는 바이너리"라면 암호화·위장 파일로 의심한다.
+# 예: 무작위 바이트로 채운 secret.txt, 헤더가 지워진 photo.png
+_EXPECT_IDENTIFIABLE_EXTS: FrozenSet[str] = frozenset(
+    _TEXT_FAMILY
+    | _ZIP_FAMILY
+    | _OLE_FAMILY
+    | {".png", ".jpg", ".gif", ".pdf", ".sqlite", ".sqlite3", ".db", ".gz"}
+)
 
 _KNOWN_EXT_NORMALIZE = {
     ".jpe": ".jpg",
@@ -113,7 +142,7 @@ def probe_file_type(
         try:
             mime = magic.from_file(str(path), mime=True) or ""
             desc = magic.from_file(str(path), mime=False) or ""
-            if mime:
+            if mime and mime.lower() != "application/octet-stream":
                 return {
                     "real_mime": mime,
                     "real_ext": _ext_from_mime(mime),
@@ -122,6 +151,7 @@ def probe_file_type(
                 }
         except Exception:
             pass  # libmagic 오류 시 내장 판별로 넘어간다.
+        # libmagic이 octet-stream으로 포기한 경우에도 내장 표(BOM, HWP 등)로 한 번 더 확인한다.
 
     try:
         with path.open("rb") as f:
@@ -204,6 +234,10 @@ def _probe_header(head: bytes) -> Dict[str, str]:
     if not head:
         return {"real_mime": "inode/x-empty", "real_ext": "",
                 "description": "empty", "source": "header"}
+
+    if head.startswith(_TEXT_BOMS):
+        return {"real_mime": "text/plain", "real_ext": ".txt",
+                "description": "text with BOM (UTF-8/16/32)", "source": "header"}
 
     for offset, sig, mime, ext in _SIGNATURES:
         if head[offset:offset + len(sig)] == sig:
@@ -294,6 +328,7 @@ def _allowed_exts(mime: str, real_ext: str) -> FrozenSet[str]:
     Returns:
         허용 확장자 집합. 비어 있으면 판정 불가를 뜻한다.
     """
+    mime = mime.lower()
     allowed = {_normalize_ext(e) for e in mimetypes.guess_all_extensions(mime)}
     if real_ext:
         allowed.add(_normalize_ext(real_ext))
@@ -308,11 +343,13 @@ def _is_ext_mismatch(disk_ext: str, real_mime: str, real_ext: str) -> bool:
     """디스크상 확장자가 실제 형식과 어긋나는지 판정한다.
 
     판정 규칙:
-        - 형식을 확정할 수 없으면(빈 파일, 알 수 없는 바이너리) False.
-        - 허용 확장자 집합을 만들 수 없으면 False(보수적으로 일치 처리).
-        - 확장자가 없는 텍스트 파일(README 등)은 False.
-        - 확장자가 없는 비텍스트 파일은 True(형식 은닉 의심).
-        - 그 외에는 허용 집합에 없으면 True.
+        - 빈 파일이면 False.
+        - 실제 형식이 "알 수 없는 바이너리"인데 확장자가 텍스트이거나 시그니처가
+          있어야 하는 형식(.png, .pdf, .zip 등)이면 True. 암호화·헤더 훼손 위장 의심.
+        - 실제 형식이 "알 수 없는 바이너리"이고 확장자도 그런 약속이 없는
+          형식(.bin, .dat 등)이면 False.
+        - 형식이 판별됐는데 확장자가 없으면, 텍스트는 False(README 등), 그 외는 True.
+        - 그 밖에는 허용 확장자 집합에 없으면 True.
 
     Args:
         disk_ext: 디스크상 확장자.
@@ -325,17 +362,26 @@ def _is_ext_mismatch(disk_ext: str, real_mime: str, real_ext: str) -> bool:
     Example:
         >>> _is_ext_mismatch(".jpg", "image/png", ".png")
         True
-        >>> _is_ext_mismatch(".log", "text/plain", ".txt")
+        >>> _is_ext_mismatch(".txt", "application/octet-stream", "")   # 무작위 바이트
+        True
+        >>> _is_ext_mismatch(".bin", "application/octet-stream", "")
         False
-        >>> _is_ext_mismatch(".apk", "application/zip", ".zip")
+        >>> _is_ext_mismatch(".py", "text/plain", ".txt")
+        False
+        >>> _is_ext_mismatch(".hwp", "application/x-ole-storage", ".doc")
         False
     """
-    if real_mime in _UNDETERMINED_MIMES:
+    mime = (real_mime or "").lower()
+    d = _normalize_ext(disk_ext)
+
+    if mime in _EMPTY_MIMES:
         return False
-    allowed = _allowed_exts(real_mime, real_ext)
+    if mime in _UNKNOWN_BINARY_MIMES:
+        return d in _EXPECT_IDENTIFIABLE_EXTS
+
+    allowed = _allowed_exts(mime, real_ext)
     if not allowed:
         return False
-    d = _normalize_ext(disk_ext)
     if not d:
-        return not real_mime.startswith("text/")
+        return not mime.startswith("text/")
     return d not in allowed

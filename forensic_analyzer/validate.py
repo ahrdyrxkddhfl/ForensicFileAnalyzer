@@ -187,6 +187,101 @@ def sample_verify_hashes(
     return issues
 
 
+def load_inventory_csv(csv_path: Union[str, Path]) -> List[Dict[str, str]]:
+    """이전에 저장한 인벤토리 CSV(기준본)를 읽어 행 리스트로 반환한다.
+
+    Args:
+        csv_path: ``inventory`` 명령이 만든 CSV 경로.
+
+    Returns:
+        CSV 각 행을 딕셔너리로 담은 리스트. 값은 모두 문자열이다.
+
+    Raises:
+        FileNotFoundError: 파일이 없을 때.
+    """
+    with open(csv_path, encoding="utf-8-sig", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def compare_with_baseline(
+    current_rows: List[Dict[str, object]],
+    baseline_rows: List[Dict[str, str]],
+    *,
+    algorithms: Tuple[str, ...] = ("md5", "sha256"),
+    mtime_tolerance: float = 1e-3,
+) -> List[Issue]:
+    """기준본(예전 인벤토리)과 현재 상태를 비교해 달라진 점을 이슈로 만든다.
+
+    "수집 당시와 지금이 같은가"를 확인하는 기능이다. 같은 실행 안에서 방금 계산한
+    값끼리 비교하는 ``sample_verify_hashes``와 달리, 시간이 지난 뒤의 변조·삭제·추가를
+    잡아낼 수 있다.
+
+    파일은 ``rel_path``(루트 기준 상대 경로)로 짝을 짓는다. 기준본에 ``rel_path`` 열이
+    없으면(이전 버전 CSV) 절대 경로 ``path``로 짝을 짓는다.
+
+    Args:
+        current_rows: 지금 수집한 인벤토리 행.
+        baseline_rows: ``load_inventory_csv``로 읽은 기준본 행.
+        algorithms: 비교할 해시 알고리즘. 양쪽에 모두 값이 있을 때만 비교한다.
+        mtime_tolerance: 수정 시각 비교 허용 오차(초). CSV 저장 시 반올림을 흡수한다.
+
+    Returns:
+        이슈 리스트. 코드는 다음과 같다.
+
+        - ``BASELINE_MISSING`` (ERROR): 기준본에 있던 파일이 사라짐
+        - ``BASELINE_NEW`` (WARN): 기준본에 없던 파일이 생김
+        - ``HASH_CHANGED`` (ERROR): 해시가 달라짐(내용 변경)
+        - ``SIZE_CHANGED`` (WARN): 크기가 달라짐
+        - ``MTIME_CHANGED`` (WARN): 수정 시각이 달라짐
+        - ``BASELINE_NO_HASH`` (INFO): 해시가 한쪽에만 있어 내용 비교를 못 함
+
+    Example:
+        >>> base = load_inventory_csv("outputs/inventory_case01.csv")
+        >>> issues = compare_with_baseline(current_rows, base)
+        >>> [i.code for i in issues]
+        ['HASH_CHANGED', 'BASELINE_NEW']
+    """
+    use_rel = bool(baseline_rows) and "rel_path" in baseline_rows[0]
+    key = "rel_path" if use_rel else "path"
+    base_map = {str(r.get(key, "")): r for r in baseline_rows if r.get(key)}
+    cur_map = {str(r.get(key, "")): r for r in current_rows if r.get(key)}
+
+    issues: List[Issue] = []
+    for k in sorted(base_map.keys() - cur_map.keys()):
+        issues.append(Issue(k, "BASELINE_MISSING", "ERROR", "기준본에 있던 파일이 없음"))
+    for k in sorted(cur_map.keys() - base_map.keys()):
+        issues.append(Issue(k, "BASELINE_NEW", "WARN", "기준본에 없던 파일이 새로 생김"))
+
+    no_hash_reported = False
+    for k in sorted(base_map.keys() & cur_map.keys()):
+        b, c = base_map[k], cur_map[k]
+
+        compared_hash = False
+        for algo in algorithms:
+            bh, ch = str(b.get(algo) or "").lower(), str(c.get(algo) or "").lower()
+            if bh and ch:
+                compared_hash = True
+                if bh != ch:
+                    issues.append(Issue(k, "HASH_CHANGED", "ERROR",
+                                        f"{algo} 변경: {bh[:12]}… → {ch[:12]}…",
+                                        field=algo, value=bh))
+        if not compared_hash and not no_hash_reported:
+            issues.append(Issue("", "BASELINE_NO_HASH", "INFO",
+                                "해시가 한쪽에만 있어 내용 비교를 생략함(--with-hash로 기준본을 만들 것)"))
+            no_hash_reported = True
+
+        bs, cs = _to_int_safely(b.get("size_bytes")), _to_int_safely(c.get("size_bytes"))
+        if bs is not None and cs is not None and bs != cs:
+            issues.append(Issue(k, "SIZE_CHANGED", "WARN", f"크기 {bs} → {cs}",
+                                field="size_bytes", value=str(bs)))
+
+        bm, cm = _to_float_safely(b.get("mtime_epoch")), _to_float_safely(c.get("mtime_epoch"))
+        if bm is not None and cm is not None and abs(bm - cm) > mtime_tolerance:
+            issues.append(Issue(k, "MTIME_CHANGED", "WARN", f"수정 시각 {bm} → {cm}",
+                                field="mtime_epoch", value=str(bm)))
+    return issues
+
+
 def write_issues_csv(
     issues: List[Issue],
     csv_path: Union[str, Path],

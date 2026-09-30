@@ -21,14 +21,15 @@
 1. 확장자(.jpg, .pdf)가 아니라 실제 데이터를 보고 파일 종류를 확인한다.
    - libmagic(python-magic)이 있으면 libmagic으로 판별하고, 없으면 직접 정의한 매직 넘버 표(PNG, JPEG, GIF, PDF, ZIP, SQLite, OLE, 바이너리 plist, GZIP)로 판별한다.
    - 어느 경우에도 확장자로 형식을 추측하지 않는다. 확장자로 추측하면 확장자 위장을 탐지할 수 없기 때문이다.
-   - APK·DOCX처럼 내부가 ZIP인 형식, .log·.csv처럼 내용이 일반 텍스트인 형식은 불일치로 보지 않는다.
+   - APK·DOCX·HWPX처럼 내부가 ZIP인 형식, HWP·DOC처럼 내부가 OLE인 형식, .log·.py처럼 내용이 일반 텍스트인 형식은 불일치로 보지 않는다.
+   - 반대로 .txt·.png·.pdf처럼 식별 가능한 내용이 있어야 하는 확장자인데 내용이 알 수 없는 바이너리면 불일치로 본다(암호화 파일 은닉, 헤더 훼손 의심). 테스트 데이터의 `docs/secret.txt`가 이 경우다.
 2. 결과물에 실제 파일 타입을 기록하는 열과, 확장자와 맞는지 여부를 체크하는 열이 추가됨.
 
 ### ④ 키워드 검색(경량 텍스트 대상)
 
 1. 텍스트 파일(txt, csv, 로그파일 등) 안에서 특정 단어를 찾는다.
 2. 검색에 걸린 파일 목록과 줄 번호를 별도의 CSV에 저장한다.
-   - 파일을 UTF-8 → CP949 → latin-1 순서로 디코딩해 한글(CP949) 문서도 검색하고, 실제로 사용한 인코딩을 결과에 기록한다.
+   - BOM이 있으면 UTF-8/16/32로, 없으면 UTF-8 → CP949 → latin-1 순서로 디코딩한다. 메모장의 ANSI(CP949)·유니코드(UTF-16) 저장 문서도 검색되며, 실제로 사용한 인코딩을 결과에 기록한다.
 3. 처음엔 가벼운 텍스트만 검색, 나중에 PDF, word 파일 등도 대상으로 버전 업데이트.
 
 ### ⑤ 타임라인 뷰(경량)
@@ -39,6 +40,8 @@
 ### ⑥ 품질/검증
 
 1. 해시값 계산, CSV 내 누락 및 오류 확인. 샘플 데이터를 돌려서 비교 검증.
+   - `--baseline`: 예전에 저장한 인벤토리 CSV(기준본)와 현재 상태를 비교해 삭제(BASELINE_MISSING), 추가(BASELINE_NEW), 내용 변경(HASH_CHANGED), 크기·수정 시각 변경을 기록한다. 파일은 루트 기준 상대 경로(rel_path)로 짝지으므로 증거 폴더를 옮겨도 비교할 수 있다.
+   - `--verify-hash`: 같은 실행 안에서 일부 파일의 해시를 다시 계산해 계산 일관성을 확인한다. 시간이 지난 뒤의 변경 탐지는 `--baseline`이 담당한다.
 2. 신뢰성 확보 담기.
 
 ## 3. 설치 및 실행
@@ -48,9 +51,13 @@ pip install -r requirements.txt
 python forensic_analyzer/dummy_test.py          # 테스트용 더미 증거 생성
 
 python main.py inventory ForensicTestData --with-hash --with-signature
-python main.py search    ForensicTestData --kw password --kw 비밀번호
+python main.py search    ForensicTestData --kw error --kw 비밀번호
 python main.py timeline  ForensicTestData --tz-offset-min 540      # KST
 python main.py validate  ForensicTestData --with-hash --verify-hash --with-signature
+
+# 변경 탐지: 수집 시점의 인벤토리를 기준본으로 저장해 두고, 나중에 비교
+python main.py inventory ForensicTestData --with-hash --out outputs/baseline.csv
+python main.py validate  ForensicTestData --baseline outputs/baseline.csv
 ```
 
 결과 CSV는 `outputs/` 폴더에 `<명령>_<라벨>_<시각>.csv` 형태로 저장된다.
@@ -83,6 +90,10 @@ dummy_test.py 실행 > ForensicTestData 폴더 생성 후, 안에 더미 테스�
 2. PDF, word 문서 등 검색 기능 미지원
 3. 공격자에 의한 시간 정보 조작 가능성
 4. 분석 대상을 직접 읽으므로 접근 시간(atime)이 바뀔 수 있음 — 원본이 아닌 사본이나 읽기 전용 마운트에서 실행해야 함
+5. 심볼릭 링크: 기본 모드에서는 목록에서 제외되고, `--follow-symlinks` 모드에서는 순환 링크 방지 로직이 없음 (테스트 데이터의 `symlinks/link_to_report.txt`는 Windows에서 생성되어 실제 링크가 아닌 일반 파일임)
+6. 검색: 10MB 초과 파일은 건너뛰며 건너뛴 목록을 따로 기록하지 않음, 한 줄에 같은 키워드가 여러 번 나와도 1건으로 기록함
+7. 타임라인: Windows에서는 ctime이 생성 시각인데 MetadataChanged로 표시됨
+8. 시그니처 허용 확장자 일부를 OS의 mimetypes 설정에 의존하므로 PC마다 결과가 약간 다를 수 있음
 
 ### ③ 향후 보완점
 

@@ -30,6 +30,8 @@ def collect_inventory(
 
         row = {
             "path": str(fpath),
+            # 루트 기준 상대 경로. 증거 폴더를 다른 위치로 옮겨도 기준본과 비교할 수 있게 한다.
+            "rel_path": fpath.relative_to(root).as_posix(),
             "name": fpath.name,
             "parent": str(fpath.parent),
             "size_bytes": meta.st_size,

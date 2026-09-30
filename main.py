@@ -13,7 +13,8 @@ from forensic_analyzer.search import search_texts, write_hits_csv
 from forensic_analyzer.timeline import build_timeline_rows, write_timeline_csv
 from forensic_analyzer.validate import (
     validate_inventory_rows, sample_verify_hashes,
-    write_issues_csv, summarize_issues
+    write_issues_csv, summarize_issues,
+    load_inventory_csv, compare_with_baseline,
 )
 from forensic_analyzer.foroutput import ensure_dir, make_outpath
 
@@ -32,7 +33,7 @@ def _write_csv_dynamic(rows: List[Dict[str, object]], out_path: Union[str, Path]
 
     out = _ensure_parent(out_path)
     preferred = [
-        "path", "name", "parent", "size_bytes",
+        "path", "rel_path", "name", "parent", "size_bytes",
         "mtime_epoch", "atime_epoch", "ctime_epoch", "birthtime_epoch",
         "is_symlink", "md5", "sha256",
         "sig_mime", "sig_ext", "sig_desc", "sig_source", "ext_on_disk", "ext_mismatch",
@@ -138,7 +139,17 @@ def cmd_timeline(args: argparse.Namespace) -> None:
 
 # validate 서브커맨드
 def cmd_validate(args: argparse.Namespace) -> None:
+    """validate 서브커맨드: 인벤토리 기본 검증과 (선택) 기준본 비교를 수행한다.
+
+    ``--verify-hash``나 ``--baseline``을 주면 해시가 필요하므로 ``--with-hash``를
+    자동으로 켠다.
+
+    Args:
+        args: argparse 결과. ``root``, ``baseline``, ``verify_hash`` 등을 사용한다.
+    """
     print("[DBG] running validate, root=", args.root)
+    if args.verify_hash or args.baseline:
+        args.with_hash = True
     rows = collect_inventory(
         args.root,
         follow_symlinks=args.follow_symlinks,
@@ -159,6 +170,13 @@ def cmd_validate(args: argparse.Namespace) -> None:
             algorithms=tuple(args.hash_algorithms),
             chunk_size=args.hash_block_size,
         )
+
+    if args.baseline:
+        baseline_rows = load_inventory_csv(args.baseline)
+        issues += compare_with_baseline(
+            rows, baseline_rows, algorithms=tuple(args.hash_algorithms)
+        )
+        print(f"[INFO] compared with baseline: {args.baseline} ({len(baseline_rows)} rows)")
 
     out_dir = ensure_dir(Path(args.out_dir))
     out_issues = Path(args.out_issues) if args.out_issues else make_outpath("validate", out_dir, args.label)
@@ -217,17 +235,36 @@ def build_parser() -> argparse.ArgumentParser:
     val = sub.add_parser("validate", help="데이터 무결성 검증")
     add_common_opts(val)
     val.add_argument("--out-issues", default="", help="검증 이슈 CSV 파일 경로")
-    val.add_argument("--verify-hash", action="store_true", help="해시 샘플 재검증")
+    val.add_argument("--verify-hash", action="store_true", help="해시 샘플 재계산 일관성 검사")
+    val.add_argument("--baseline", default="", help="이전 inventory CSV와 비교해 변경·삭제·추가 탐지")
     val.add_argument("--out-inventory", help="검증에 사용된 원본 인벤토리도 저장")
     val.set_defaults(func=cmd_validate)
 
     return p
 
 
-def main():
+def main() -> None:
+    """CLI 진입점. 인자를 파싱하고 입력값을 검사한 뒤 서브커맨드를 실행한다.
 
+    잘못된 입력은 스캔을 시작하기 전에 오류로 종료한다. 오타 난 경로를
+    "파일이 없는 폴더"로 오해하거나, 긴 스캔이 끝난 뒤에야 실패하는 일을 막기 위함이다.
+    """
     parser = build_parser()
     args = parser.parse_args()
+
+    root = getattr(args, "root", None)
+    if root is not None and not Path(root).is_dir():
+        parser.error(f"root 경로가 없거나 폴더가 아닙니다: {root}")
+
+    import hashlib
+    for algo in getattr(args, "hash_algorithms", []) or []:
+        if algo.lower() not in hashlib.algorithms_available:
+            parser.error(f"지원하지 않는 해시 알고리즘: {algo}")
+
+    baseline = getattr(args, "baseline", "")
+    if baseline and not Path(baseline).is_file():
+        parser.error(f"기준본 CSV를 찾을 수 없습니다: {baseline}")
+
     if hasattr(args, 'func'):
         args.func(args)
     else:
