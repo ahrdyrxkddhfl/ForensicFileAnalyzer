@@ -35,7 +35,7 @@ def _write_csv_dynamic(rows: List[Dict[str, object]], out_path: Union[str, Path]
         "path", "name", "parent", "size_bytes",
         "mtime_epoch", "atime_epoch", "ctime_epoch", "birthtime_epoch",
         "is_symlink", "md5", "sha256",
-        "sig_mime", "sig_ext", "sig_desc", "ext_on_disk", "ext_mismatch",
+        "sig_mime", "sig_ext", "sig_desc", "sig_source", "ext_on_disk", "ext_mismatch",
     ]
     keys_order: List[str] = []
     seen = set(preferred)

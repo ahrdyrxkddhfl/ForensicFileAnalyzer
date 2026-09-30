@@ -45,6 +45,7 @@ def search_texts(
     - line_preview: 매칭 라인의 미리보기(개행 제거, 길이 제한)
     - matched: 실제 매칭된 텍스트(정규식 사용 시 그룹 전체)
     - pattern: 검색 패턴(또는 키워드)
+    - encoding: 파일을 디코딩할 때 실제로 사용한 인코딩(예: utf-8, cp949)
     """
     root = Path(root).resolve()
     _ex_patterns = tuple(exclude_globs or [])
@@ -73,33 +74,31 @@ def search_texts(
         except (OSError, PermissionError):
             continue
 
-        # 인코딩 시도
-        text_iter = _open_text_lines(fpath, encodings=encodings)
-        if text_iter is None:
+        # 인코딩 판별: UTF-8 → CP949 → latin-1 순서로 파일 전체를 디코딩
+        decoded = _open_text_lines(fpath, encodings=encodings)
+        if decoded is None:
             continue
+        lines, used_encoding = decoded
 
-        try:
-            for lineno, line in enumerate(text_iter, start=1):
-                # 개행 제거(미리보기 안정화)
-                display_line = line.rstrip("\r\n")
-                for pat in patterns:
-                    m = pat.search(line)
-                    if not m:
-                        continue
-                    start, end = m.span()
-                    snippet = _shrink(display_line, start, end, max_len=preview_max_len)
-                    rows.append({
-                        "path": str(fpath),
-                        "line_no": lineno,
-                        "match_span_start": start,
-                        "match_span_end": end,
-                        "line_preview": snippet,
-                        "matched": m.group(0),
-                        "pattern": pat.pattern,
-                    })
-        except (UnicodeDecodeError, OSError):
-            # 읽는 중 인코딩 깨짐/IO 오류 → 파일 스킵
-            continue
+        for lineno, line in enumerate(lines, start=1):
+            # 개행 제거(미리보기 안정화)
+            display_line = line.rstrip("\r\n")
+            for pat in patterns:
+                m = pat.search(line)
+                if not m:
+                    continue
+                start, end = m.span()
+                snippet = _shrink(display_line, start, end, max_len=preview_max_len)
+                rows.append({
+                    "path": str(fpath),
+                    "line_no": lineno,
+                    "match_span_start": start,
+                    "match_span_end": end,
+                    "line_preview": snippet,
+                    "matched": m.group(0),
+                    "pattern": pat.pattern,
+                    "encoding": used_encoding,
+                })
 
     return rows
 
@@ -122,6 +121,7 @@ def write_hits_csv(
         "match_span_end",
         "matched",
         "pattern",
+        "encoding",
         "line_preview",
     ]
 
@@ -200,42 +200,44 @@ def _open_text_lines(
     path: Path,
     *,
     encodings: Sequence[str],
-) -> Optional[Iterator[str]]:
+) -> Optional[Tuple[List[str], str]]:
+    """파일 전체를 후보 인코딩 순서대로 디코딩해 라인 목록과 사용 인코딩을 반환한다.
+
+    파일을 텍스트 모드로 ``open``만 해서는 디코딩이 일어나지 않는다. 디코딩은
+    실제로 읽는 순간 일어나므로, open 단계에서 예외를 기다리는 방식으로는
+    다음 인코딩으로 넘어갈 수 없다. 그래서 바이트를 먼저 전부 읽은 뒤
+    인코딩별로 ``decode``를 시도한다. 호출 측에서 파일 크기 상한을 이미
+    걸고 있으므로 전체를 메모리에 올려도 된다.
+
+    Args:
+        path: 읽을 텍스트 파일 경로.
+        encodings: 순서대로 시도할 인코딩 목록. 앞쪽일수록 우선한다.
+            ``latin-1``은 모든 바이트를 디코딩하므로 마지막에 두어야 한다.
+
+    Returns:
+        ``(라인 리스트, 사용한 인코딩)`` 튜플. 파일을 읽지 못하면 None.
+        모든 후보가 실패하면 첫 인코딩을 ``errors="replace"``로 사용하고
+        인코딩 이름 뒤에 ``+replace``를 붙여 손실 가능성을 기록한다.
+
+    Example:
+        >>> lines, enc = _open_text_lines(Path("cp949_memo.txt"),
+        ...                               encodings=("utf-8", "cp949"))
+        >>> enc
+        'cp949'
     """
-    여러 인코딩 후보를 순차 시도하여 텍스트 라인 Iterator를 반환.
-    실패 시 None.
-    """
-    for enc in encodings:
-        try:
-            f = path.open("r", encoding=enc, errors="strict")
-            # 파일 객체를 제너레이터로 감싸 반환
-            return _line_iter(f)
-        except (UnicodeDecodeError, LookupError):
-            # 인코딩 해석 실패 → 다음 인코딩 시도
-            continue
-        except (OSError, PermissionError):
-            return None
-    # 마지막 : 'errors=ignore'로 깨진 문자를 무시하고 읽기
     try:
-        f = path.open("r", encoding=encodings[0] if encodings else "utf-8", errors="ignore")
-        return _line_iter(f)
-    except (OSError, PermissionError):
+        raw = path.read_bytes()
+    except OSError:
         return None
 
-
-def _line_iter(f):
-    """
-    파일 핸들을 받아 한 줄씩 yield.
-    호출 측에서 try/except로 감싸기 쉽게 분리.
-    """
-    try:
-        for line in f:
-            yield line
-    finally:
+    for enc in encodings:
         try:
-            f.close()
-        except Exception:
-            pass
+            return raw.decode(enc).splitlines(keepends=True), enc
+        except (UnicodeDecodeError, LookupError):
+            continue
+
+    fallback = encodings[0] if encodings else "utf-8"
+    return raw.decode(fallback, errors="replace").splitlines(keepends=True), f"{fallback}+replace"
 
 
 def _shrink(line: str, start: int, end: int, *, max_len: int = 240) -> str:

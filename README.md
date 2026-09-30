@@ -2,7 +2,7 @@
 
 ## 1. 목적
 
-파일 해시값 계산(MD5, SHA-256), 파일 시그니처 확인(매직 너머로 실제 파일 타입 판별), 메타데이터 추출(생성/수정 시간 등), .csv 형태로 결과 저장, 간단한 키워드 검색 기능(문서 파일 내 특정 단어 찾기) 기능을 포함한 파일 분석 도구 개발을 목적으로 한다.
+파일 해시값 계산(MD5, SHA-256), 파일 시그니처 확인(매직 넘버로 실제 파일 타입 판별), 메타데이터 추출(생성/수정 시간 등), .csv 형태로 결과 저장, 간단한 키워드 검색 기능(문서 파일 내 특정 단어 찾기) 기능을 포함한 파일 분석 도구 개발을 목적으로 한다.
 
 ## 2. 프로그램 개발
 
@@ -14,17 +14,21 @@
 ### ② 해시 계산 (MD5 + SHA-256)
 
 1. 각 파일의 고유값을 만듦. 파일이 나중에 바뀌었는지, 복사본이 같은지 확인할 수 있다.
-2. 결과물은 위의 표(CSV)에 MD45, SHA-256열이 추가된 형태.
+2. 결과물은 위의 표(CSV)에 MD5, SHA-256열이 추가된 형태.
 
 ### ③ 파일 시그니처 확인(libmagic)
 
 1. 확장자(.jpg, .pdf)가 아니라 실제 데이터를 보고 파일 종류를 확인한다.
+   - libmagic(python-magic)이 있으면 libmagic으로 판별하고, 없으면 직접 정의한 매직 넘버 표(PNG, JPEG, GIF, PDF, ZIP, SQLite, OLE, 바이너리 plist, GZIP)로 판별한다.
+   - 어느 경우에도 확장자로 형식을 추측하지 않는다. 확장자로 추측하면 확장자 위장을 탐지할 수 없기 때문이다.
+   - APK·DOCX처럼 내부가 ZIP인 형식, .log·.csv처럼 내용이 일반 텍스트인 형식은 불일치로 보지 않는다.
 2. 결과물에 실제 파일 타입을 기록하는 열과, 확장자와 맞는지 여부를 체크하는 열이 추가됨.
 
 ### ④ 키워드 검색(경량 텍스트 대상)
 
 1. 텍스트 파일(txt, csv, 로그파일 등) 안에서 특정 단어를 찾는다.
 2. 검색에 걸린 파일 목록과 줄 번호를 별도의 CSV에 저장한다.
+   - 파일을 UTF-8 → CP949 → latin-1 순서로 디코딩해 한글(CP949) 문서도 검색하고, 실제로 사용한 인코딩을 결과에 기록한다.
 3. 처음엔 가벼운 텍스트만 검색, 나중에 PDF, word 파일 등도 대상으로 버전 업데이트.
 
 ### ⑤ 타임라인 뷰(경량)
@@ -37,7 +41,21 @@
 1. 해시값 계산, CSV 내 누락 및 오류 확인. 샘플 데이터를 돌려서 비교 검증.
 2. 신뢰성 확보 담기.
 
-## 3. 결과
+## 3. 설치 및 실행
+
+```bash
+pip install -r requirements.txt
+python forensic_analyzer/dummy_test.py          # 테스트용 더미 증거 생성
+
+python main.py inventory ForensicTestData --with-hash --with-signature
+python main.py search    ForensicTestData --kw password --kw 비밀번호
+python main.py timeline  ForensicTestData --tz-offset-min 540      # KST
+python main.py validate  ForensicTestData --with-hash --verify-hash --with-signature
+```
+
+결과 CSV는 `outputs/` 폴더에 `<명령>_<라벨>_<시각>.csv` 형태로 저장된다.
+
+## 4. 결과
 
 ### ① 실행
 #### 더미 데이터 생성
@@ -64,6 +82,7 @@ dummy_test.py 실행 > ForensicTestData 폴더 생성 후, 안에 더미 테스�
 1. 지워진 파일 복구 미지원
 2. PDF, word 문서 등 검색 기능 미지원
 3. 공격자에 의한 시간 정보 조작 가능성
+4. 분석 대상을 직접 읽으므로 접근 시간(atime)이 바뀔 수 있음 — 원본이 아닌 사본이나 읽기 전용 마운트에서 실행해야 함
 
 ### ③ 향후 보완점
 
@@ -75,4 +94,3 @@ dummy_test.py 실행 > ForensicTestData 폴더 생성 후, 안에 더미 테스�
 ### 관련 학습 내용 정리
 
 - https://velog.io/@ahrdyrxkddhfl/파일-시스템
-- 
