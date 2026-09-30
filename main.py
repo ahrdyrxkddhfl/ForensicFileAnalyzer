@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse
 import csv
+import hashlib
 from pathlib import Path
 from typing import Dict, List, Union
 
@@ -17,6 +18,44 @@ from forensic_analyzer.validate import (
     load_inventory_csv, compare_with_baseline,
 )
 from forensic_analyzer.foroutput import ensure_dir, make_outpath
+
+
+def _normalize_hash_algorithms(
+    algorithms: List[str], parser: argparse.ArgumentParser
+) -> List[str]:
+    """해시 알고리즘 이름을 소문자로 통일하고, 이 도구에서 쓸 수 있는지 미리 검사한다.
+
+    스캔이 다 끝난 뒤에 실패하지 않도록 파일을 읽기 전에 검사한다.
+
+    - 대소문자를 통일한다. ``SHA256``을 그대로 쓰면 CSV 열 이름이 ``SHA256``이 되어
+      기준본의 ``sha256`` 열과 짝이 맞지 않기 때문이다.
+    - ``shake_128``처럼 출력 길이를 따로 지정해야 하는 알고리즘은 거부한다.
+      ``hexdigest()``를 인자 없이 호출할 수 없어 스캔 뒤에 TypeError가 나기 때문이다.
+    - 중복은 한 번만 남긴다.
+
+    Args:
+        algorithms: 사용자가 ``--hash-algorithms``로 준 이름 목록.
+        parser: 오류 메시지를 출력하고 종료할 파서.
+
+    Returns:
+        정규화한 알고리즘 이름 목록.
+
+    Example:
+        >>> _normalize_hash_algorithms(["SHA256", "md5", "sha256"], parser)
+        ['sha256', 'md5']
+    """
+    normalized: List[str] = []
+    for algo in algorithms:
+        name = algo.strip().lower()
+        try:
+            hashlib.new(name).hexdigest()
+        except ValueError:
+            parser.error(f"지원하지 않는 해시 알고리즘: {algo}")
+        except TypeError:
+            parser.error(f"출력 길이를 지정해야 하는 알고리즘은 쓸 수 없습니다: {algo}")
+        if name not in normalized:
+            normalized.append(name)
+    return normalized
 
 
 # CSV 저장
@@ -36,7 +75,7 @@ def _write_csv_dynamic(rows: List[Dict[str, object]], out_path: Union[str, Path]
         "path", "rel_path", "name", "parent", "size_bytes",
         "mtime_epoch", "atime_epoch", "ctime_epoch", "birthtime_epoch",
         "is_symlink", "md5", "sha256",
-        "sig_mime", "sig_ext", "sig_desc", "sig_source", "ext_on_disk", "ext_mismatch",
+        "sig_mime", "sig_ext", "sig_desc", "sig_source", "sig_high_entropy", "ext_on_disk", "ext_mismatch",
     ]
     keys_order: List[str] = []
     seen = set(preferred)
@@ -172,7 +211,7 @@ def cmd_validate(args: argparse.Namespace) -> None:
         )
 
     if args.baseline:
-        baseline_rows = load_inventory_csv(args.baseline)
+        baseline_rows = args.baseline_rows  # main()에서 형식 검사를 마친 기준본
         issues += compare_with_baseline(
             rows, baseline_rows, algorithms=tuple(args.hash_algorithms)
         )
@@ -256,14 +295,17 @@ def main() -> None:
     if root is not None and not Path(root).is_dir():
         parser.error(f"root 경로가 없거나 폴더가 아닙니다: {root}")
 
-    import hashlib
-    for algo in getattr(args, "hash_algorithms", []) or []:
-        if algo.lower() not in hashlib.algorithms_available:
-            parser.error(f"지원하지 않는 해시 알고리즘: {algo}")
+    if hasattr(args, "hash_algorithms"):
+        args.hash_algorithms = _normalize_hash_algorithms(args.hash_algorithms, parser)
 
     baseline = getattr(args, "baseline", "")
-    if baseline and not Path(baseline).is_file():
-        parser.error(f"기준본 CSV를 찾을 수 없습니다: {baseline}")
+    if baseline:
+        if not Path(baseline).is_file():
+            parser.error(f"기준본 CSV를 찾을 수 없습니다: {baseline}")
+        try:
+            args.baseline_rows = load_inventory_csv(baseline)
+        except ValueError as e:
+            parser.error(str(e))
 
     if hasattr(args, 'func'):
         args.func(args)

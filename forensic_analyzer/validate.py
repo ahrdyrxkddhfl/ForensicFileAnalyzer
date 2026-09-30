@@ -193,14 +193,30 @@ def load_inventory_csv(csv_path: Union[str, Path]) -> List[Dict[str, str]]:
     Args:
         csv_path: ``inventory`` 명령이 만든 CSV 경로.
 
+    인벤토리 CSV가 아닌 파일(README 등)을 기준본으로 잘못 주면, 모든 파일이
+    "새로 생김"으로 나와 결과를 오해하게 된다. 그래서 필수 열이 없으면 오류로 처리한다.
+
     Returns:
         CSV 각 행을 딕셔너리로 담은 리스트. 값은 모두 문자열이다.
 
     Raises:
         FileNotFoundError: 파일이 없을 때.
+        ValueError: 인벤토리 CSV 형식이 아닐 때(``path``/``rel_path``, ``size_bytes``,
+            ``mtime_epoch`` 열이 없음).
     """
-    with open(csv_path, encoding="utf-8-sig", newline="") as f:
-        return list(csv.DictReader(f))
+    try:
+        with open(csv_path, encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            fields = set(reader.fieldnames or [])
+            rows = list(reader)
+    except UnicodeDecodeError:
+        raise ValueError(f"기준본이 텍스트 CSV가 아닙니다: {csv_path}")
+
+    if not ({"path", "rel_path"} & fields) or not {"size_bytes", "mtime_epoch"} <= fields:
+        raise ValueError(
+            f"기준본이 inventory CSV 형식이 아닙니다(path·size_bytes·mtime_epoch 열 필요): {csv_path}"
+        )
+    return rows
 
 
 def compare_with_baseline(
@@ -230,10 +246,12 @@ def compare_with_baseline(
 
         - ``BASELINE_MISSING`` (ERROR): 기준본에 있던 파일이 사라짐
         - ``BASELINE_NEW`` (WARN): 기준본에 없던 파일이 생김
+        - ``MOVED`` (WARN): 같은 해시의 파일이 경로만 바뀜(MISSING+NEW 대신 기록)
         - ``HASH_CHANGED`` (ERROR): 해시가 달라짐(내용 변경)
         - ``SIZE_CHANGED`` (WARN): 크기가 달라짐
         - ``MTIME_CHANGED`` (WARN): 수정 시각이 달라짐
-        - ``BASELINE_NO_HASH`` (INFO): 해시가 한쪽에만 있어 내용 비교를 못 함
+        - ``BASELINE_NO_HASH`` (WARN): 공통 해시 열이 없어 내용 무결성을 검증하지 못함
+        - ``HASH_NOT_COMPARED`` (WARN): 해당 파일의 해시 값이 비어 비교하지 못함
 
     Example:
         >>> base = load_inventory_csv("outputs/inventory_case01.csv")
@@ -246,40 +264,93 @@ def compare_with_baseline(
     base_map = {str(r.get(key, "")): r for r in baseline_rows if r.get(key)}
     cur_map = {str(r.get(key, "")): r for r in current_rows if r.get(key)}
 
-    issues: List[Issue] = []
-    for k in sorted(base_map.keys() - cur_map.keys()):
-        issues.append(Issue(k, "BASELINE_MISSING", "ERROR", "기준본에 있던 파일이 없음"))
-    for k in sorted(cur_map.keys() - base_map.keys()):
-        issues.append(Issue(k, "BASELINE_NEW", "WARN", "기준본에 없던 파일이 새로 생김"))
+    # 양쪽 모두에 열이 있는 알고리즘만 비교 대상이다(sha256을 md5보다 우선).
+    base_cols = set(baseline_rows[0].keys()) if baseline_rows else set()
+    cur_cols = set(current_rows[0].keys()) if current_rows else set()
+    common_algos = [a for a in sorted(algorithms, key=lambda a: a != "sha256")
+                    if a in base_cols and a in cur_cols]
 
-    no_hash_reported = False
+    issues: List[Issue] = []
+    if not common_algos:
+        issues.append(Issue(
+            "", "BASELINE_NO_HASH", "WARN",
+            "기준본과 현재 인벤토리에 공통 해시 열이 없어 내용 무결성을 검증하지 못함 "
+            "(크기·수정 시각까지 맞춘 변조는 탐지 불가). 같은 알고리즘으로 --with-hash 기준본을 만들 것",
+        ))
+
+    missing = sorted(base_map.keys() - cur_map.keys())
+    new = sorted(cur_map.keys() - base_map.keys())
+
+    # 이동 탐지: 사라진 파일과 새 파일의 해시가 같으면 "이동"으로 묶는다.
+    if common_algos:
+        algo = common_algos[0]
+        new_by_hash: Dict[str, List[str]] = {}
+        for k in new:
+            h = str(cur_map[k].get(algo) or "").lower()
+            if h:
+                new_by_hash.setdefault(h, []).append(k)
+        moved_missing, moved_new = set(), set()
+        for k in missing:
+            h = str(base_map[k].get(algo) or "").lower()
+            if h and new_by_hash.get(h):
+                dst = new_by_hash[h].pop(0)
+                moved_missing.add(k)
+                moved_new.add(dst)
+                issues.append(Issue(_display_path(cur_map[dst], dst), "MOVED", "WARN",
+                                    f"경로 변경(내용 동일): {k} → {dst}"))
+        missing = [k for k in missing if k not in moved_missing]
+        new = [k for k in new if k not in moved_new]
+
+    for k in missing:
+        issues.append(Issue(_display_path(base_map[k], k), "BASELINE_MISSING", "ERROR",
+                            f"기준본에 있던 파일이 없음: {k}"))
+    for k in new:
+        issues.append(Issue(_display_path(cur_map[k], k), "BASELINE_NEW", "WARN",
+                            f"기준본에 없던 파일이 새로 생김: {k}"))
+
     for k in sorted(base_map.keys() & cur_map.keys()):
         b, c = base_map[k], cur_map[k]
+        shown = _display_path(c, k)
 
         compared_hash = False
-        for algo in algorithms:
+        for algo in common_algos:
             bh, ch = str(b.get(algo) or "").lower(), str(c.get(algo) or "").lower()
             if bh and ch:
                 compared_hash = True
                 if bh != ch:
-                    issues.append(Issue(k, "HASH_CHANGED", "ERROR",
+                    issues.append(Issue(shown, "HASH_CHANGED", "ERROR",
                                         f"{algo} 변경: {bh[:12]}… → {ch[:12]}…",
                                         field=algo, value=bh))
-        if not compared_hash and not no_hash_reported:
-            issues.append(Issue("", "BASELINE_NO_HASH", "INFO",
-                                "해시가 한쪽에만 있어 내용 비교를 생략함(--with-hash로 기준본을 만들 것)"))
-            no_hash_reported = True
+        if common_algos and not compared_hash:
+            issues.append(Issue(shown, "HASH_NOT_COMPARED", "WARN",
+                                "해시 값이 비어 있어(읽기 실패 등) 내용 비교를 못 함"))
 
         bs, cs = _to_int_safely(b.get("size_bytes")), _to_int_safely(c.get("size_bytes"))
         if bs is not None and cs is not None and bs != cs:
-            issues.append(Issue(k, "SIZE_CHANGED", "WARN", f"크기 {bs} → {cs}",
+            issues.append(Issue(shown, "SIZE_CHANGED", "WARN", f"크기 {bs} → {cs}",
                                 field="size_bytes", value=str(bs)))
 
         bm, cm = _to_float_safely(b.get("mtime_epoch")), _to_float_safely(c.get("mtime_epoch"))
         if bm is not None and cm is not None and abs(bm - cm) > mtime_tolerance:
-            issues.append(Issue(k, "MTIME_CHANGED", "WARN", f"수정 시각 {bm} → {cm}",
+            issues.append(Issue(shown, "MTIME_CHANGED", "WARN", f"수정 시각 {bm} → {cm}",
                                 field="mtime_epoch", value=str(bm)))
     return issues
+
+
+def _display_path(row: Dict[str, object], fallback: str) -> str:
+    """이슈 CSV의 path 열에 쓸 경로를 고른다.
+
+    다른 검증 이슈와 기준을 맞추기 위해 절대 경로(``path``)를 우선 쓰고,
+    없으면 짝짓기에 쓴 키(상대 경로)를 쓴다. 상대 경로는 detail 열에 함께 남긴다.
+
+    Args:
+        row: 인벤토리 행(현재 또는 기준본).
+        fallback: ``path``가 없을 때 쓸 값.
+
+    Returns:
+        표시할 경로 문자열.
+    """
+    return str(row.get("path") or fallback)
 
 
 def write_issues_csv(
