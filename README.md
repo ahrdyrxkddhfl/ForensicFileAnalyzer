@@ -96,7 +96,7 @@
 | `BASELINE_NO_HASH` / `HASH_NOT_COMPARED` | WARN | 해시가 없어 내용 검증을 못 함(전체 / 파일 단위) |
 | `EXT_MISMATCH` | WARN | 확장자와 실제 내용이 다름(위장 의심) |
 | `TS_SUSPICIOUS` / `TS_FUTURE` | WARN | 0 이하 / 미래 시각(조작 의심) |
-| `HASH_READ_FAIL` / `SIGNATURE_READ_FAIL` / `SCAN_ERROR` | WARN | 읽지 못해 확인하지 못함 |
+| `HASH_READ_FAIL` / `HASH_VERIFY_READ_FAIL` / `SIGNATURE_READ_FAIL` / `SCAN_ERROR` | WARN | 읽지 못해 확인하지 못함(`HASH_VERIFY_READ_FAIL`은 `--verify-hash` 재계산 시) |
 | `CHANGED_DURING_HASH` | WARN | 수집과 해시 계산 사이에 파일이 바뀜 |
 | `SIZE_MISMATCH` / `TS_BAD_TYPE` / `DUP_PATH` | WARN | 기록 불일치·형식 오류·중복 경로 |
 | `BASELINE_OPTIONS_DIFFER` | WARN | 기준본과 스캔 옵션(링크·제외)이 다름 |
