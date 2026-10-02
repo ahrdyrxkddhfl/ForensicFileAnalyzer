@@ -5,6 +5,7 @@ import os
 import random
 import zipfile
 from pathlib import Path
+from typing import Dict, Union
 
 import pytest
 
@@ -21,14 +22,25 @@ def _mismatch(path: Path, magic: bool) -> bool:
     return row["ext_mismatch"]
 
 
-def _zip_bytes(tmp_path: Path, member: str) -> bytes:
-    """``member`` 하나를 담은 ZIP 바이트를 만든다(형식별로 실제와 비슷한 내부 파일명 사용)."""
+def _zip_bytes(tmp_path: Path, member: Union[str, Dict[str, bytes]]) -> bytes:
+    """ZIP 바이트를 만든다. 문자열이면 그 이름의 파일 하나(내용 ``x``), 딕셔너리면 이름 → 내용."""
+    members = {member: b"x"} if isinstance(member, str) else member
     z = tmp_path / "_tmp.zip"
     with zipfile.ZipFile(z, "w") as zf:
-        zf.writestr(member, "x")
+        for name, content in members.items():
+            zf.writestr(name, content)
     data = z.read_bytes()
     z.unlink()
     return data
+
+
+AXML = b"\x03\x00\x08\x00" + bytes(60)          # 컴파일된 AndroidManifest.xml 앞부분
+DEX = b"dex\n035\x00" + bytes(100)
+APK = {"AndroidManifest.xml": AXML, "classes.dex": DEX, "classes2.dex": DEX, "resources.arsc": b"\x02\x00\x0c\x00"}
+XML_PLIST = b'<?xml version="1.0"?>\n<plist version="1.0"><dict/></plist>\n'
+IPA = {"Payload/Notes.app/Info.plist": XML_PLIST, "Payload/Notes.app/Notes": b"\xcf\xfa\xed\xfe" + bytes(100)}
+DOCX = {"[Content_Types].xml": b"<Types/>", "_rels/.rels": b"<Relationships/>", "word/document.xml": b"<w:document/>"}
+XLSX = {"[Content_Types].xml": b"<Types/>", "xl/workbook.xml": b"<workbook/>"}
 
 
 ELF = b"\x7fELF\x02\x01\x01" + bytes(57) + b"\x00" * 400
@@ -62,6 +74,17 @@ def test_must_detect(write, tmp_path: Path, rng: random.Random, magic: bool) -> 
         "fake.exe": b"not really an executable\n" * 20,
         "elf_as.jpg": ELF,                                         # 사진으로 위장한 리눅스 실행 파일
         "raw_as.png": CR2,
+        # ZIP 내부 구조: 확장자가 요구하는 앱·문서 구조가 없음
+        "plain_zip.apk": _zip_bytes(tmp_path, "photo.jpg"),                     # 일반 압축 파일 이름만 바꿈
+        "docx_as.apk": _zip_bytes(tmp_path, DOCX),                             # 워드 문서 이름만 바꿈
+        "text_manifest.apk": _zip_bytes(tmp_path, {"AndroidManifest.xml": b"<manifest/>", "classes.dex": DEX}),
+        "fake_dex.apk": _zip_bytes(tmp_path, {**APK, "classes2.dex": b"not a dex file"}),
+        "plain_zip.ipa": _zip_bytes(tmp_path, "readme.txt"),
+        "fake_plist.ipa": _zip_bytes(tmp_path, {"Payload/X.app/Info.plist": b"just text"}),
+        "apk_as.docx": _zip_bytes(tmp_path, APK),                              # 진짜 앱을 문서로 위장
+        "docx_as.xlsx": _zip_bytes(tmp_path, DOCX),
+        "plain_zip.hwpx": _zip_bytes(tmp_path, "Contents/section0.xml"),        # mimetype 없음
+        "truncated.apk": _zip_bytes(tmp_path, APK)[:120],                     # 끝이 잘려 구조를 못 읽음
     }
     for name, data in cases.items():
         assert _mismatch(write(name, data), magic), name
@@ -80,8 +103,16 @@ def test_must_not_flag(write, tmp_path: Path, rng: random.Random, magic: bool) -
         "u16bom_zh.txt": "".join(chr(0x4E00 + (i * 7919) % 20000) for i in range(3000)).encode("utf-16"),
         "doc.hwp": OLE + rng.randbytes(600),
         "Thumbs.db": OLE + rng.randbytes(1000),
-        "app.apk": _zip_bytes(tmp_path, "AndroidManifest.xml"),
-        "doc.hwpx": _zip_bytes(tmp_path, "Contents/section0.xml"),
+        "app.apk": _zip_bytes(tmp_path, APK),
+        "split.apk": _zip_bytes(tmp_path, {"AndroidManifest.xml": AXML, "res/a.xml": AXML}),  # DEX 없는 분할 APK
+        "app.ipa": _zip_bytes(tmp_path, IPA),
+        "bplist.ipa": _zip_bytes(tmp_path, {"Payload/A.app/Info.plist": b"bplist00" + bytes(40)}),
+        "report.docx": _zip_bytes(tmp_path, DOCX), "macro.docm": _zip_bytes(tmp_path, DOCX),
+        "sheet.xlsx": _zip_bytes(tmp_path, XLSX),
+        "doc.hwpx": _zip_bytes(tmp_path, {"mimetype": b"application/hwp+zip", "Contents/section0.xml": b"<s/>"}),
+        "book.epub": _zip_bytes(tmp_path, {"mimetype": b"application/epub+zip", "OEBPS/a.xhtml": b"<p/>"}),
+        "apk_as.zip": _zip_bytes(tmp_path, APK),                                # APK도 ZIP인 것은 사실
+        "lib.jar": _zip_bytes(tmp_path, "META-INF/MANIFEST.MF"),
         "tool.exe": _pe_bytes(),
         "mz_note.txt": b"MZ is the start of this plain note.\n" * 30,
         "bmw.txt": b"BMW review text\n" * 30,
@@ -163,3 +194,53 @@ def test_rule_table(disk: str, mime: str, ext: str, expected: bool) -> None:
 def test_embedded_rule() -> None:
     assert is_ext_mismatch(".txt", "text/plain", ".txt", embedded_binary=True)
     assert not is_ext_mismatch(".txt", "text/plain", ".txt", embedded_binary=False)
+
+
+@pytest.mark.parametrize("magic", MAGIC_MODES)
+def test_zip_container_identified(write, tmp_path: Path, magic: bool) -> None:
+    """ZIP은 libmagic 유무와 관계없이 내부 구조로 판별하고 근거를 남긴다."""
+    row = add_signature_to_rows([{"path": str(write("x.apk", _zip_bytes(tmp_path, APK)))}], prefer_magic=magic)[0]
+    assert row["sig_mime"] == "application/vnd.android.package-archive"
+    assert row["sig_source"] == "container"
+    assert "DEX 2개" in row["sig_desc"]
+
+    row = add_signature_to_rows([{"path": str(write("y.apk", _zip_bytes(tmp_path, "a.txt")))}], prefer_magic=magic)[0]
+    assert row["sig_mime"] == "application/zip"
+    assert "일반 ZIP" in row["sig_desc"]
+
+
+
+
+@pytest.mark.parametrize("field,flag", [(8, 0x01), (10, 0x1234)])   # 암호화 플래그 / 지원하지 않는 압축 방식
+def test_zip_container_unreadable_core_file(write, tmp_path: Path, field: int, flag: int) -> None:
+    """핵심 내부 파일을 읽지 못하면 앱으로 인정하지 않되, "APK 아님"으로 단정하지도 않는다."""
+    from forensic_analyzer.container import inspect_zip
+    data = bytearray(_zip_bytes(tmp_path, APK))
+    cd = data.index(b"PK\x01\x02")        # 첫 중앙 디렉터리 항목 = AndroidManifest.xml
+    value = int.from_bytes(data[cd + field:cd + field + 2], "little") | flag
+    data[cd + field:cd + field + 2] = value.to_bytes(2, "little")
+    found = inspect_zip(write("tampered.apk", bytes(data)))
+    assert found.kind == ""
+    assert "읽을 수 없음" in found.desc and "APK 아님" not in found.desc
+
+
+def test_zip_container_duplicate_names(write, tmp_path: Path) -> None:
+    """같은 이름의 내부 파일이 여러 개면 어느 것을 판정했는지 보장할 수 없어 인정하지 않는다."""
+    import warnings
+    from forensic_analyzer.container import inspect_zip
+    z = tmp_path / "dup.apk"
+    with warnings.catch_warnings(), zipfile.ZipFile(z, "w") as zf:
+        warnings.simplefilter("ignore")              # zipfile의 중복 이름 경고
+        zf.writestr("AndroidManifest.xml", b"<fake/>")
+        zf.writestr("AndroidManifest.xml", AXML)
+    found = inspect_zip(z)
+    assert found.kind == "" and "변조 의심" in found.desc
+    assert add_signature_to_rows([{"path": str(z)}], prefer_magic=False)[0]["ext_mismatch"]
+
+
+def test_zip_container_generic_desc_keeps_declared_mimetype(write, tmp_path: Path) -> None:
+    """확인 대상이 아닌 ZIP 기반 문서(ODG 등)를 "문서가 아니다"로 적지 않는다."""
+    from forensic_analyzer.container import inspect_zip
+    odg = {"mimetype": b"application/vnd.oasis.opendocument.graphics", "content.xml": b"<c/>"}
+    found = inspect_zip(write("draw.odg", _zip_bytes(tmp_path, odg)))
+    assert found.kind == "" and "mimetype=application/vnd.oasis.opendocument.graphics" in found.desc

@@ -6,6 +6,9 @@
 이름은 ``memo.txt``인데 내용은 텍스트가 아닌 파일을 찾아낸다.
 
 판별 순서:
+    0. ZIP(``PK``로 시작)이면 libmagic을 쓰지 않고 ZIP 안을 열어 APK·IPA·DOCX·HWPX
+       등 내부 구조를 확인한다(``container.py``). libmagic의 ZIP 세부 판별은 버전마다
+       다르고 무엇을 확인했는지 알 수 없어서, 직접 확인한 결과로 판정한다.
     1. python-magic(libmagic)이 설치되어 있으면 libmagic을 쓴다. libmagic이
        ``application/octet-stream``(모름)으로 포기하면 2번으로 넘어간다.
     2. 이 모듈의 매직 넘버 표(``SIGNATURES``)로 직접 판별한다.
@@ -33,7 +36,7 @@ import mimetypes
 from pathlib import Path
 from typing import Dict, FrozenSet, List, Optional, Tuple, Union
 
-from . import textutil
+from . import container, textutil
 
 try:
     import magic  # type: ignore
@@ -135,7 +138,8 @@ _PE_EXTS: FrozenSet[str] = frozenset({".exe", ".dll", ".sys", ".scr", ".ocx", ".
 # MIME별로 추가로 허용하는 확장자(같은 컨테이너 형식을 공유하는 경우).
 EXTRA_ALLOWED_EXTS: Dict[str, FrozenSet[str]] = {
     "text/plain": TEXT_FAMILY,
-    "application/zip": ZIP_FAMILY,
+    # 일반 ZIP에는 내부 구조 확인이 필요한 확장자(.apk·.docx 등)를 허용하지 않는다.
+    "application/zip": ZIP_FAMILY - container.STRUCTURE_CHECKED_EXTS,
     "application/vnd.sqlite3": frozenset({".sqlite", ".sqlite3", ".db"}),
     "application/x-sqlite3": frozenset({".sqlite", ".sqlite3", ".db"}),
     "application/x-ole-storage": OLE_FAMILY,
@@ -144,20 +148,13 @@ EXTRA_ALLOWED_EXTS: Dict[str, FrozenSet[str]] = {
     "application/x-hwp": frozenset({".hwp"}),
     "application/vnd.hancom.hwp": frozenset({".hwp"}),
     "application/haansofthwp": frozenset({".hwp"}),
-    "application/hwp+zip": frozenset({".hwpx"}),
     "application/vnd.hancom.hwpx": frozenset({".hwpx"}),
     "application/x-bplist": frozenset({".plist"}),
     "image/jpeg": frozenset({".jpg"}),
+    # ZIP 내부 구조로 확인한 형식. 모두 ZIP이 맞으므로 .zip도 거짓 확장자가 아니다.
+    **{t.mime: t.exts | {".zip"} for t in container.CONTAINER_TYPES.values()},
     # libmagic이 내놓지만 Python 내장 MIME 표에는 확장자가 없는 형식들
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": frozenset({".docx", ".docm"}),
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": frozenset({".xlsx", ".xlsm"}),
-    "application/vnd.openxmlformats-officedocument.presentationml.presentation": frozenset({".pptx", ".pptm"}),
-    "application/vnd.oasis.opendocument.text": frozenset({".odt"}),
-    "application/vnd.oasis.opendocument.spreadsheet": frozenset({".ods"}),
-    "application/vnd.oasis.opendocument.presentation": frozenset({".odp"}),
-    "application/epub+zip": frozenset({".epub"}),
     "application/java-archive": frozenset({".jar", ".apk", ".aar"}),
-    "application/vnd.android.package-archive": frozenset({".apk"}),
     "application/x-dosexec": _PE_EXTS,
     "application/vnd.microsoft.portable-executable": _PE_EXTS,
     "application/x-7z-compressed": frozenset({".7z"}),
@@ -205,6 +202,7 @@ UNKNOWN_BINARY_MIMES: FrozenSet[str] = frozenset({"", "application/octet-stream"
 # sig_source 값
 SOURCE_LIBMAGIC = "libmagic"
 SOURCE_HEADER = "header"
+SOURCE_CONTAINER = "container"
 SOURCE_TEXT = "text"
 SOURCE_UNKNOWN = "unknown"
 SOURCE_ERROR = "error"
@@ -225,7 +223,7 @@ def probe_file_type(path: Union[str, Path], *, prefer_magic: bool = True) -> Opt
         - ``real_mime`` (str): 판별된 MIME. 모르면 ``application/octet-stream``.
         - ``real_ext`` (str): MIME의 대표 확장자(예: ``.png``). 모르면 빈 문자열.
         - ``description`` (str): 사람이 읽을 수 있는 설명.
-        - ``source`` (str): 판별 근거(``libmagic``/``header``/``text``/``unknown``).
+        - ``source`` (str): 판별 근거(``container``/``libmagic``/``header``/``text``/``unknown``).
         - ``high_entropy`` (bool): 표본 구간 중 압축·암호화 수준의 엔트로피가 있으면 True.
           정상 ZIP·JPEG도 True이므로 이것만으로 의심 파일이라고 볼 수 없다.
         - ``embedded_binary`` (bool): 앞부분은 텍스트인데 중간·끝 구간에 텍스트가
@@ -245,8 +243,11 @@ def probe_file_type(path: Union[str, Path], *, prefer_magic: bool = True) -> Opt
     if not head:
         return _result("inode/x-empty", "", "empty", SOURCE_HEADER)
 
+    header = _probe_bytes(head)
     result: Optional[Dict[str, object]] = None
-    if prefer_magic and _HAS_MAGIC:
+    if header["real_mime"] == "application/zip":
+        result = _probe_zip(path)
+    elif prefer_magic and _HAS_MAGIC:
         try:
             mime = (magic.from_file(str(path), mime=True) or "").lower()
             desc = magic.from_file(str(path), mime=False) or ""
@@ -254,7 +255,6 @@ def probe_file_type(path: Union[str, Path], *, prefer_magic: bool = True) -> Opt
                 result = _result(mime, _ext_from_mime(mime), desc, SOURCE_LIBMAGIC)
         except Exception:
             result = None  # libmagic 오류 시 내장 판별로 넘어간다.
-    header = _probe_bytes(head)
     if result is None:
         result = header
     # libmagic이 우리 표에 없는 MIME을 내놓으면 허용 확장자를 알 수 없다. 그때 판정에
@@ -353,6 +353,10 @@ def is_ext_mismatch(
           리눅스 실행 파일·텍스트·DB처럼 원래 확장자 없이 흔한 형식은 False.
         - 이 도구가 모르는 확장자(``KNOWN_EXTS``에 없음, 예: ``libc.so.6``의 ``.6``)면
           판정할 근거가 없으므로 False("판정 불가").
+        - ZIP은 내부 구조로 판별한 형식을 기준으로 본다. ``.apk``·``.ipa``·``.docx``·
+          ``.hwpx``처럼 내부 구조가 정해진 확장자인데 그 구조가 아니면 True(일반 ZIP을
+          ``.apk``로, APK를 ``.docx``로 바꾼 경우). APK·DOCX 등을 ``.zip``으로 둔 것은
+          False(ZIP인 것은 사실이다).
         - 그 밖에는 허용 확장자 집합에 없으면 True. libmagic이 우리 표에 없는 MIME을
           내놓아 허용 집합이 비면, 내장 판별 결과(``fallback_*``)의 허용 집합을 쓴다.
           그래도 비면 판정할 수 없으므로 False.
@@ -382,6 +386,10 @@ def is_ext_mismatch(
         >>> is_ext_mismatch("", "application/x-executable", "")        # 확장자 없는 리눅스 실행 파일
         False
         >>> is_ext_mismatch(".cr2", "image/tiff", ".tiff")             # TIFF 구조의 카메라 RAW
+        False
+        >>> is_ext_mismatch(".apk", "application/zip", ".zip")         # 앱 구조가 없는 일반 ZIP
+        True
+        >>> is_ext_mismatch(".zip", "application/vnd.android.package-archive", ".apk")
         False
     """
     mime = (real_mime or "").lower()
@@ -425,6 +433,23 @@ def _result(mime: str, ext: str, desc: str, source: str) -> Dict[str, object]:
     return {"real_mime": mime, "real_ext": ext, "description": desc, "source": source,
             "high_entropy": False, "embedded_binary": False,
             "fallback_mime": "", "fallback_ext": ""}
+
+
+def _probe_zip(path: Union[str, Path]) -> Dict[str, object]:
+    """ZIP 내부 구조로 형식을 판별한다.
+
+    Args:
+        path: ``PK``로 시작하는 파일 경로.
+
+    Returns:
+        ``_result`` 형식의 딕셔너리. 앱·문서 구조가 확인되지 않으면(손상된 ZIP 포함)
+        ``application/zip``이다.
+    """
+    found = container.inspect_zip(path)
+    if found.kind:
+        t = container.CONTAINER_TYPES[found.kind]
+        return _result(t.mime, t.ext, found.desc, SOURCE_CONTAINER)
+    return _result("application/zip", ".zip", found.desc, SOURCE_CONTAINER)
 
 
 def _probe_bytes(head: bytes) -> Dict[str, object]:

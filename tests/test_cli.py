@@ -74,7 +74,8 @@ def test_dummy_data_expected_findings(data: Path, tmp_path: Path) -> None:
     out = tmp_path / "inv.csv"
     _run(["inventory", str(data), "--with-signature", "--sig-no-magic", "--out", str(out)])
     flagged = sorted(r["rel_path"] for r in _read(out) if r["ext_mismatch"] == "True")
-    assert flagged == ["docs/meeting_notes.txt", "docs/secret.txt", "images/mismatch_signature.jpg"]
+    assert flagged == ["apps/renamed_archive.apk", "docs/meeting_notes.txt", "docs/secret.txt",
+                       "images/mismatch_signature.jpg"]
 
     hits = tmp_path / "hits.csv"
     _run(["search", str(data), "--kw", "error", "--kw", "비밀번호", "--out-hits", str(hits)])

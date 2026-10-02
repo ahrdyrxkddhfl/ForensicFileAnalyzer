@@ -37,6 +37,7 @@
 
 확장자가 아니라 **실제 바이트**로 형식을 판별한다. 확장자로 형식을 추측하면 위장을 탐지할 수 없기 때문이다.
 
+0. ZIP(`PK`로 시작)이면 libmagic을 쓰지 않고 **ZIP 안을 열어 내부 구조로** 판별한다. APK·IPA·DOCX·HWPX는 앞부분 시그니처가 모두 ZIP과 같아서, 형식마다 반드시 있어야 하는 내부 파일을 확인해야 구분된다(아래 "ZIP 내부 구조").
 1. libmagic(python-magic)이 있으면 libmagic으로 판별한다.
 2. 없거나 libmagic이 "모름"이라고 하면 내장 매직 넘버 표로 판별한다: PNG, JPEG, GIF, PDF, ZIP, OLE(HWP·DOC), SQLite, 바이너리 plist, GZIP, 7z, RAR, ELF, **윈도우 실행 파일(MZ + PE 헤더 구조 확인)**, BMP, TIFF(카메라 RAW 포함), WEBP·WAV·AVI(RIFF), MP4·MOV·HEIC·AVIF·CR3(ftyp), FLAC, OGG, MP3(ID3).
 3. 그래도 모르면 텍스트인지 판별한다(아래 "텍스트 판별").
@@ -47,13 +48,33 @@
 | 무작위(암호화) 바이트인 `secret.txt` | 불일치 |
 | 앞은 텍스트, 뒤에 데이터를 붙인 `meeting_notes.txt` | 불일치(중간·끝 구간 표본 검사) |
 | 헤더가 지워진 `.png`·`.pdf`·`.zip`·`.hwp` | 불일치 |
+| 일반 ZIP·워드 문서를 이름만 바꾼 `.apk`·`.ipa`, 진짜 APK를 바꾼 `.docx` | 불일치(ZIP 내부 구조 확인) |
+| 매니페스트가 텍스트이거나 `classes.dex`가 DEX가 아닌 `.apk` | 불일치(내부 파일도 이름만 믿지 않음) |
 | 확장자를 떼어 숨긴 사진·영상·음성·PDF | 불일치 |
-| HWP·DOC·`Thumbs.db`(OLE), APK·DOCX·HWPX(ZIP), `.py`·`.log`(텍스트) | 정상 |
+| HWP·DOC·`Thumbs.db`(OLE), 구조가 확인된 APK·IPA·DOCX·HWPX(ZIP), `.py`·`.log`(텍스트) | 정상 |
+| DEX가 없는 분할 APK, APK·DOCX를 `.zip`으로 둔 것(ZIP인 것은 사실) | 정상(`sig_mime`·`sig_desc`에 내부 형식 표시) |
 | 확장자 없는 리눅스 실행 파일(`ls`), `libc.so.6`, `mod.ko`, 카메라 RAW(`.CR2`·`.NEF`·`.DNG`) | 정상 |
 | `.bin`·`.dat`에 담긴 알 수 없는 바이너리, 빈 파일 | 정상 |
 | 이 도구가 모르는 확장자(예: `.xyz`) | 판정 불가(불일치로 보지 않음) |
 
 허용 확장자 목록 방식은 모든 형식을 다 담을 수 없다. 그래서 근거가 있을 때만 불일치로 판정하고, 도구가 모르는 확장자는 "판정 불가"로 둔다. 불일치 경고가 너무 많으면 진짜 위장이 묻히기 때문이다.
+
+**ZIP 내부 구조**(`container.py`): 내부 파일도 이름만으로는 믿지 않는다. 앱 패키지는 핵심 파일의 앞부분 바이트까지 확인한다. 판별 근거는 `sig_source=container`, `sig_desc`에 남는다.
+
+| 형식 | 확인하는 것 |
+|---|---|
+| APK | `AndroidManifest.xml`이 빌드 때 컴파일된 바이너리 XML(`03 00 08 00`). `classes*.dex`가 있으면 `dex\n`으로 시작(DEX가 없는 분할 APK도 있어 필수는 아님) |
+| IPA | `Payload/<앱>.app/Info.plist`가 있고 내용이 plist(`bplist00` 또는 XML) |
+| DOCX·XLSX·PPTX | `[Content_Types].xml`과 본문 폴더(`word/`·`xl/`·`ppt/`) |
+| HWPX·ODT·ODS·ODP·EPUB | 내부 파일 `mimetype`에 적힌 형식 이름 |
+
+다음 경우는 앱·문서로 인정하지 않되, "아니다"와 구분해 이유를 남긴다.
+
+- 끝이 잘려 ZIP 구조를 읽을 수 없음
+- 핵심 파일을 읽을 수 없음(암호화 플래그·지원하지 않는 압축 방식). 안드로이드는 이런 조작을 무시하고 설치하지만 분석 도구는 막히므로, 악성 앱의 분석 방해 기법일 수 있다.
+- 같은 이름의 내부 파일이 여러 개(어느 것을 판정했는지 보장할 수 없어 변조 의심으로 표시)
+
+APK·DOCX를 `.zip`으로 둔 것을 정상으로 보는 것은 의도한 정책이다. `.zip`은 거짓 확장자가 아니고, 앱인지는 `sig_mime`으로 확인할 수 있다. libmagic 환경에서는 이전에 이 경우가 불일치로 나왔을 수 있다.
 
 **텍스트 판별**(`textutil.py`): 인코딩별로 실제 디코딩이 되는지와, 디코딩 결과의 **출력 가능 문자 비율**을 함께 본다. BOM → UTF-8 → CP949 → Shift-JIS → GBK → CP1252 → BOM 없는 UTF-16 순서다. BOM 없는 UTF-16은 두 바이트 순서로 모두 읽어 보고, 디코딩 결과가 그럴듯한 글자(ASCII·한중일 문자 등)로 이뤄진 쪽을 고른다. 무작위 바이트 앞에 BOM만 붙여 텍스트로 위장하는 우회도 막는다. 로그 중간이 0으로 채워진 구간은 떼어 놓고 판단한다. 테스트에서 100바이트 이상 무작위 데이터는 1,000개 중 0개가 텍스트로 오판됐다.
 
@@ -137,6 +158,7 @@ python main.py validate  ForensicTestData --baseline outputs/baseline.csv
 
 | rel_path | sig_mime | sig_desc |
 |---|---|---|
+| apps/renamed_archive.apk | application/zip | 일반 ZIP(내부 구조로 확인하는 형식 아님) |
 | docs/meeting_notes.txt | text/plain | 텍스트(utf-8) / 중간·끝 구간에 텍스트가 아닌 데이터 |
 | docs/secret.txt | application/octet-stream | 알 수 없는 바이너리 |
 | images/mismatch_signature.jpg | image/png | PNG image data, 1 x 1, 8-bit/color RGBA |
@@ -170,7 +192,7 @@ python -m pytest -q
 | 파일 | 검사 내용 |
 |---|---|
 | `test_textutil.py` | 다국어·인코딩별 텍스트 인식, 무작위 바이트 오판률, BOM 우회 |
-| `test_signature.py` | 잡아야 하는 위장 / 잡으면 안 되는 정상 파일, 읽기 실패 처리, 판정 규칙 |
+| `test_signature.py` | 잡아야 하는 위장 / 잡으면 안 되는 정상 파일(APK·IPA·문서의 ZIP 내부 구조 포함), 읽기 실패 처리, 판정 규칙 |
 | `test_inventory_hashing.py` | 정렬·상대 경로, 심볼릭 링크 정책, 순환 링크, OS별 시간 필드, 해시 상태 |
 | `test_search_timeline.py` | 인코딩별 검색, 줄마다 인코딩이 다른 로그(무작위로 섞은 파일 40개를 원문과 비교), 잘린·깨진 파일 검색, 줄 번호, 건너뛴 파일 기록, 수상한 시각 |
 | `test_validate.py` | 변조·이동·삭제 판정, 해시 없는 기준본, NFD 파일명, CSV 수식 주입 왕복 |
@@ -184,6 +206,7 @@ forensic_analyzer/
   inventory.py               폴더 순회, 메타데이터, 심볼릭 링크 정책
   hashing.py                 해시 계산과 상태
   signature.py               매직 넘버·libmagic 판별, 확장자 위장 판정
+  container.py               ZIP 내부 구조로 APK·IPA·DOCX·HWPX 등 판별
   textutil.py                텍스트·인코딩 판별(시그니처와 검색이 공용)
   search.py                  키워드 검색
   timeline.py                타임라인
@@ -206,12 +229,15 @@ tests/                       pytest
 9. 대부분의 Linux에서는 생성 시각을 제공하지 않아 `birthtime_epoch`가 비어 있다.
 10. 확장자 위장 판정은 허용 확장자 목록 방식이라, 도구가 모르는 확장자로 위장한 파일(예: PNG를 `.xyz`로)은 "판정 불가"로 두고 잡지 않는다.
 11. 시그니처 판별은 파일 앞부분을 인코딩 하나로 판정하므로, UTF-8 줄과 CP949 줄이 뒤섞인 로그는 "알 수 없는 바이너리"로 보고 확장자 불일치 경고를 낼 수 있다. 검색은 줄 단위로 읽으므로 이런 파일에서도 키워드를 정상적으로 찾는다.
+12. ZIP 내부 구조 확인은 패키지 구조 수준이다. APK 서명 검증이나 코드(DEX) 디컴파일은 하지 않는다. 문서(DOCX 등)는 필수 파일 이름까지만 보므로, 이름을 맞춰 일부러 만든 ZIP은 통과할 수 있다. AAB·XAPK·JAR 등 그 밖의 ZIP 계열은 내부 구조를 확인하지 않고 ZIP 계열 확장자로만 허용한다.
 
 ## 8. 향후 보완점
 
-1. 이미지(EXIF)·문서·압축 파일 내부 상세 분석
-2. 디스크 이미지(E01, dd) 직접 분석
-3. 검색 인덱스로 대용량 검색 속도 향상
+1. 앱 패키지 정보 추출(IPA `Info.plist`의 번들 ID·버전, APK 매니페스트의 패키지명·권한)
+2. 앱 동작 전후 데이터 폴더 비교 결과를 SQLite 테이블·설정 파일 키 단위로 표시
+3. 이미지(EXIF)·문서 내부 상세 분석
+4. 디스크 이미지(E01, dd) 직접 분석
+5. 검색 인덱스로 대용량 검색 속도 향상
 
 ### 관련 학습 내용 정리
 

@@ -5,6 +5,7 @@
 
 - 확장자 위장: PNG 내용인 ``.jpg``(잡아야 함), 무작위 바이트인 ``.txt``(잡아야 함),
   텍스트 뒤에 무작위 데이터를 붙인 ``.txt``(잡아야 함), 정상 PNG·ZIP·텍스트(잡으면 안 됨)
+- 앱 패키지: 일반 ZIP의 이름만 바꾼 ``.apk``(잡아야 함), APK 최소 구조를 갖춘 ``.apk``(잡으면 안 됨)
 - 인코딩 검색: UTF-8, CP949(메모장 ANSI), UTF-16(메모장 유니코드) 한글 메모
 - 해시: 내용이 같은 두 파일, 0바이트 파일, 10MB 파일(조각 단위 해시)
 - 경로: 한글·특수문자 파일명, 깊은 폴더, 심볼릭 링크
@@ -116,6 +117,12 @@ def generate(root: Path = DEFAULT_ROOT) -> Path:
     write(images / "corrupted_photo.jpg", b"\xff\xd8\xff\xe0" + b"THIS_IS_CORRUPTED_NOT_A_REAL_JPEG")
     make_zip(bins / "archive.zip", {"inner/readme.txt": b"This is inside zip\n",
                                     "inner/data.bin": rng.randbytes(2048)})
+
+    # 앱 패키지: 최소 구조 APK(컴파일된 매니페스트 헤더 + DEX 헤더) / 일반 ZIP의 이름만 바꾼 APK
+    apps = root / "apps"
+    make_zip(apps / "structured_sample.apk", {"AndroidManifest.xml": b"\x03\x00\x08\x00" + bytes(60),
+                                              "classes.dex": b"dex\n035\x00" + bytes(104)})
+    make_zip(apps / "renamed_archive.apk", {"photos/img_001.jpg": b"\xff\xd8\xff\xe0" + bytes(64)})
 
     # 텍스트·인코딩
     write(docs / "notes.txt", b"hello\nthis is a note\n")
