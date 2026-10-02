@@ -80,7 +80,7 @@ AXML_MAGIC = b"\x03\x00\x08\x00"
 DEX_MAGIC = b"dex\n"
 
 _DEX_NAME = re.compile(r"classes\d*\.dex")
-_IPA_PLIST = re.compile(r"Payload/[^/]+\.app/Info\.plist")
+IPA_PLIST = re.compile(r"Payload/[^/]+\.app/Info\.plist")
 _OOXML_PARTS = (("word/", "docx"), ("xl/", "xlsx"), ("ppt/", "pptx"))
 _MIMETYPE_KINDS: Dict[str, str] = {CONTAINER_TYPES[k].mime: k for k in ("hwpx", "odt", "ods", "odp", "epub")}
 
@@ -120,7 +120,7 @@ def _identify(zf: zipfile.ZipFile, names: Set[str]) -> ZipInspection:
     """
     if "AndroidManifest.xml" in names:
         return _check_apk(zf, names)
-    plists = sorted(n for n in names if _IPA_PLIST.fullmatch(n))
+    plists = sorted(n for n in names if IPA_PLIST.fullmatch(n))
     if plists:
         return _check_ipa(zf, plists[0])
     if "[Content_Types].xml" in names:

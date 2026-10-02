@@ -83,6 +83,20 @@ def test_dummy_data_expected_findings(data: Path, tmp_path: Path) -> None:
     assert found == [("app.log", "utf-8"), ("memo_cp949.txt", "cp949"), ("memo_utf16.txt", "utf-16")]
 
 
+def test_apps_command_lists_dummy_apps(data: Path, tmp_path: Path) -> None:
+    pytest.importorskip("androguard")
+    out = tmp_path / "apps.csv"
+    _run(["apps", str(data), "--with-hash", "--out-apps", str(out)])
+    found = {r["rel_path"]: (r["package"], r["status"]) for r in _read(out)}
+    assert found == {
+        "apps/backup.zip": ("com.example.tracker", "ok"),        # .zip으로 둔 앱도 찾음
+        "apps/renamed_archive.apk": ("", "not_app"),
+        "apps/sample.ipa": ("org.example.photos", "ok"),
+        "apps/structured_sample.apk": ("org.example.notes", "ok"),
+    }
+    assert all(r["sha256"] for r in _read(out))
+
+
 def test_baseline_roundtrip_via_cli(data: Path, tmp_path: Path) -> None:
     base = tmp_path / "baseline.csv"
     issues = tmp_path / "issues.csv"

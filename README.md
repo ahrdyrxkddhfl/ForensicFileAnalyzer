@@ -2,7 +2,7 @@
 
 [![tests](https://github.com/ahrdyrxkddhfl/ForensicFileAnalyzer/actions/workflows/tests.yml/badge.svg)](https://github.com/ahrdyrxkddhfl/ForensicFileAnalyzer/actions/workflows/tests.yml)
 
-증거 폴더를 스캔해 **파일 목록·해시·실제 형식·시간 정보**를 CSV로 기록하고, **확장자 위장**을 찾고, **수집 이후 변경·삭제·이동**을 검증하는 명령줄 도구입니다.
+증거 폴더를 스캔해 **파일 목록·해시·실제 형식·시간 정보**를 CSV로 기록하고, **확장자 위장**을 찾고, **수집 이후 변경·삭제·이동**을 검증하는 명령줄 도구입니다. 폴더 안의 **앱 패키지(APK·IPA)**를 확장자와 상관없이 찾아 패키지명·버전·권한도 기록합니다.
 
 > EVI$ION 프로젝트로 시작해, 코드 리뷰에서 나온 탐지 누락·오탐 사례를 모두 재현 테스트(pytest)로 고정하며 보완했습니다.
 
@@ -18,6 +18,7 @@
 | `search` | 텍스트 파일 키워드·정규식 검색(UTF-8, CP949, UTF-16 등) | `search_*.csv`, 검색 못 한 파일 `*_skipped.csv` |
 | `timeline` | 생성·메타데이터 변경·수정·접근 시각을 시간순 사건으로 정렬 | `timeline_*.csv` |
 | `validate` | 인벤토리 무결성 검사, 기준본(`--baseline`)과 비교해 변경·삭제·추가·이동 탐지 | `validate_*.csv` |
+| `apps` | APK·IPA를 확장자와 상관없이 찾아 패키지명·버전·SDK·권한·서명 정보 추출 | `apps_*.csv` |
 
 ### ① 파일 인벤토리 & 메타데이터
 
@@ -124,6 +125,22 @@ APK·DOCX를 `.zip`으로 둔 것을 정상으로 보는 것은 의도한 정책
 | `LINK_BROKEN` / `SYMLINK_CYCLE_SKIPPED` | INFO | 대상이 없는 심볼릭 링크 / 순환 링크를 막음 |
 | `BASELINE_META_MISSING` | INFO | 기준본의 스캔 정보가 없어 옵션 비교를 못 함 |
 
+### ⑦ 앱 패키지 정보
+
+ZIP 내부 구조(③)로 APK·IPA를 찾으므로 `.zip`으로 둔 앱도 목록에 나온다. 무슨 앱인지(패키지명·번들 ID, 버전)와 무엇을 요구하는지(권한)를 한 줄씩 기록하고, `--with-hash`면 해시도 함께 남겨 악성 앱 정보 조회에 쓸 수 있게 한다.
+
+| 열 | APK | IPA |
+|---|---|---|
+| `package` | 패키지명 | `CFBundleIdentifier`(번들 ID) |
+| `version_name` / `version_code` | `versionName` / `versionCode` | `CFBundleShortVersionString` / `CFBundleVersion` |
+| `min_os` / `target_sdk` | 최소·대상 SDK | `MinimumOSVersion` / `DTPlatformVersion` |
+| `permissions` | 요청 권한(`uses-permission`) | 권한 사유 키(`NS...UsageDescription`) |
+| `signing` | 서명 방식(`v1`·`v2`·`v3`) | 서명 파일 유무(`code_signature`·`provisioning_profile`) |
+
+- APK 매니페스트는 빌드 때 바이너리 XML로 컴파일되어 직접 해석하기 어려우므로 오픈소스 **androguard**로 읽는다. IPA의 `Info.plist`는 표준 라이브러리 `plistlib`으로 읽는다(XML·바이너리 plist 모두).
+- 암호화 플래그·지원하지 않는 압축 방식처럼 분석을 방해하는 ZIP 조작이 있어도, 안드로이드처럼 읽어 정보를 뽑는다. 이때 `structure_ok=False`와 구조 확인 결과(`structure_desc`)를 함께 남긴다.
+- 확장자가 `.apk`·`.ipa`인 파일은 결과에서 빼지 않는다. 앱 표식이 없으면 `status=not_app`, 파일이나 정보를 읽지 못하면 `parse_error`로 남긴다.
+
 ### 결과 CSV 보안
 
 파일명은 증거를 만든 사람이 마음대로 정할 수 있다. `=HYPERLINK(...)`처럼 엑셀 수식으로 시작하는 값은 앞에 `'`를 붙여 결과 CSV를 여는 분석가 PC에서 수식이 실행되지 않게 하고(CSV 수식 주입 방지), 기준본으로 다시 읽을 때는 원래 값으로 되돌린다. 원래부터 `'`로 시작하는 파일명에도 `'`를 하나 더 붙여, 되돌릴 때 원래 이름과 정확히 같아지게 한다. `--label`은 파일명에 안전한 문자만 남기며, 같은 초에 다시 실행해도 이전 결과를 덮어쓰지 않는다.
@@ -142,6 +159,7 @@ python main.py inventory ForensicTestData --with-hash --with-signature
 python main.py search    ForensicTestData --kw error --kw 비밀번호
 python main.py timeline  ForensicTestData --tz-offset-min 540
 python main.py validate  ForensicTestData --with-hash --verify-hash --with-signature
+python main.py apps      ForensicTestData --with-hash
 
 # 변경 탐지: 수집 시점의 인벤토리를 기준본으로 저장해 두고 나중에 비교
 python main.py inventory ForensicTestData --with-hash --out outputs/baseline.csv
@@ -171,6 +189,15 @@ python main.py validate  ForensicTestData --baseline outputs/baseline.csv
 | docs/memo_utf16.txt | 2 | 비밀번호 | utf-16 |
 | logs/app.log | 2 | ERROR | utf-8 |
 
+**앱 패키지** (`apps`) — 더미 APK는 테스트용으로 컴파일된 매니페스트를 직접 만들어 넣었다. 표에서는 권한 앞의 `android.permission.`을 생략했다
+
+| rel_path | package | version_name | permissions | status |
+|---|---|---|---|---|
+| apps/backup.zip | com.example.tracker | 0.9 | ACCESS_FINE_LOCATION; RECEIVE_BOOT_COMPLETED | ok |
+| apps/renamed_archive.apk | | | | not_app |
+| apps/sample.ipa | org.example.photos | 2.1 | NSCameraUsageDescription; NSPhotoLibraryUsageDescription | ok |
+| apps/structured_sample.apk | org.example.notes | 1.2.0 | INTERNET; READ_CONTACTS | ok |
+
 **기준본 비교** — 기준본 저장 후 `notes.txt`를 같은 크기로 고치고 수정 시각을 되돌림, `table.csv`를 다른 폴더로 이동, `app.log`를 삭제
 
 | severity | code | detail |
@@ -196,6 +223,7 @@ python -m pytest -q
 | `test_inventory_hashing.py` | 정렬·상대 경로, 심볼릭 링크 정책, 순환 링크, OS별 시간 필드, 해시 상태 |
 | `test_search_timeline.py` | 인코딩별 검색, 줄마다 인코딩이 다른 로그(무작위로 섞은 파일 40개를 원문과 비교), 잘린·깨진 파일 검색, 줄 번호, 건너뛴 파일 기록, 수상한 시각 |
 | `test_validate.py` | 변조·이동·삭제 판정, 해시 없는 기준본, NFD 파일명, CSV 수식 주입 왕복 |
+| `test_appinfo.py` | APK·IPA 정보 추출, `.zip`으로 둔 앱, 분석 방해 ZIP 조작이 있는 APK, 깨진 plist, androguard가 없을 때 |
 | `test_cli.py` | 잘못된 입력 사전 차단, 결과 폴더 자동 제외, 스캔 옵션 비교, 더미 데이터 전체 결과 |
 
 ## 6. 구조
@@ -211,6 +239,7 @@ forensic_analyzer/
   search.py                  키워드 검색
   timeline.py                타임라인
   validate.py                검증, 기준본 비교
+  appinfo.py                 앱 패키지(APK·IPA) 정보·권한 추출
   foroutput.py               CSV 저장(원자적 저장, 수식 주입 방지)
   dummy_test.py              테스트용 더미 증거 생성
 tests/                       pytest
@@ -230,14 +259,14 @@ tests/                       pytest
 10. 확장자 위장 판정은 허용 확장자 목록 방식이라, 도구가 모르는 확장자로 위장한 파일(예: PNG를 `.xyz`로)은 "판정 불가"로 두고 잡지 않는다.
 11. 시그니처 판별은 파일 앞부분을 인코딩 하나로 판정하므로, UTF-8 줄과 CP949 줄이 뒤섞인 로그는 "알 수 없는 바이너리"로 보고 확장자 불일치 경고를 낼 수 있다. 검색은 줄 단위로 읽으므로 이런 파일에서도 키워드를 정상적으로 찾는다.
 12. ZIP 내부 구조 확인은 패키지 구조 수준이다. APK 서명 검증이나 코드(DEX) 디컴파일은 하지 않는다. 문서(DOCX 등)는 필수 파일 이름까지만 보므로, 이름을 맞춰 일부러 만든 ZIP은 통과할 수 있다. AAB·XAPK·JAR 등 그 밖의 ZIP 계열은 내부 구조를 확인하지 않고 ZIP 계열 확장자로만 허용한다.
+13. 앱 정보는 패키지에 적힌 값을 읽는 수준이다. APK 서명은 있는지(방식)만 보고 인증서를 검증하지 않으며, 코드 디컴파일·동적 분석은 하지 않는다. App Store에서 받은 IPA의 실행 파일 암호화(FairPlay) 여부도 확인하지 않는다. 앱 이름이 리소스 참조인데 리소스가 조작되면 `app_name`이 비어 있을 수 있다. 압축 안의 압축에 든 앱(XAPK·APKS 묶음, ZIP 안의 APK)은 찾지 않는다. androguard는 APK 전체를 메모리에 올리므로 수 GB 크기의 APK는 메모리를 많이 쓴다.
 
 ## 8. 향후 보완점
 
-1. 앱 패키지 정보 추출(IPA `Info.plist`의 번들 ID·버전, APK 매니페스트의 패키지명·권한)
-2. 앱 동작 전후 데이터 폴더 비교 결과를 SQLite 테이블·설정 파일 키 단위로 표시
-3. 이미지(EXIF)·문서 내부 상세 분석
-4. 디스크 이미지(E01, dd) 직접 분석
-5. 검색 인덱스로 대용량 검색 속도 향상
+1. 앱 동작 전후 데이터 폴더 비교 결과를 SQLite 테이블·설정 파일 키 단위로 표시
+2. 이미지(EXIF)·문서 내부 상세 분석
+3. 디스크 이미지(E01, dd) 직접 분석
+4. 검색 인덱스로 대용량 검색 속도 향상
 
 ### 관련 학습 내용 정리
 

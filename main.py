@@ -6,6 +6,7 @@
     search     텍스트 파일 키워드·정규식 검색
     timeline   파일 시간 정보로 시간순 사건 목록 생성
     validate   인벤토리 검증과 기준본(예전 인벤토리) 비교
+    apps       앱 패키지(APK·IPA)를 확장자와 상관없이 찾아 패키지명·버전·권한 기록
 
 모든 입력값은 스캔을 시작하기 전에 검사한다. 긴 스캔이 끝난 뒤에야 잘못된 옵션
 때문에 실패하거나, 오타 난 경로를 "파일 없는 폴더"로 오해하는 일을 막기 위함이다.
@@ -13,6 +14,7 @@
 Example:
     $ python main.py inventory ForensicTestData --with-hash --with-signature
     $ python main.py validate ForensicTestData --baseline outputs/baseline.csv
+    $ python main.py apps ForensicTestData --with-hash
 """
 from __future__ import annotations
 
@@ -27,6 +29,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from forensic_analyzer import __version__
+from forensic_analyzer.appinfo import APP_FIELDS, collect_app_rows
 from forensic_analyzer.foroutput import ensure_dir, make_outpath, meta_path_for, write_json, write_rows_csv
 from forensic_analyzer.hashing import add_hashes_to_rows
 from forensic_analyzer.inventory import INVENTORY_FIELDS, KIND_SYMLINK_CYCLE, collect_inventory
@@ -252,6 +255,29 @@ def cmd_validate(args: argparse.Namespace) -> None:
         write_inventory(rows, Path(args.out_inventory), args)
 
 
+def cmd_apps(args: argparse.Namespace) -> None:
+    """apps: 앱 패키지를 찾아 식별 정보와 권한을 CSV로 저장한다.
+
+    앱인지는 ZIP 내부 구조로 판단하므로 시그니처 판별을 자동으로 켠다.
+
+    Args:
+        args: 파싱된 명령줄 인자.
+    """
+    print(f"[INFO] apps root={args.root}")
+    args.with_signature = True
+    errors: List[Dict[str, str]] = []
+    rows = build_inventory(args, errors)
+    algos = list(args.hash_algorithms) if args.with_hash else []
+    apps = collect_app_rows(rows, hash_algorithms=algos)
+    out_path = Path(args.out_apps) if args.out_apps else make_outpath("apps", ensure_dir(Path(args.out_dir)), args.label)
+    write_rows_csv(apps, out_path, preferred=[*APP_FIELDS, *algos])
+    print(f"[OK] {len(apps)} app candidates -> {out_path}")
+    failed = sum(1 for a in apps if a["status"] != "ok")
+    if failed:
+        print(f"[WARN] {failed} candidates could not be read as apps (see status/detail)")
+    report_scan_errors(errors, out_path)
+
+
 # ---------------------------------------------------------------------------
 # 인자 파싱과 사전 검사
 # ---------------------------------------------------------------------------
@@ -313,6 +339,11 @@ def build_parser() -> argparse.ArgumentParser:
     val.add_argument("--baseline", default="", help="이전 inventory CSV와 비교해 변경·삭제·추가·이동 탐지")
     val.add_argument("--out-inventory", default="", help="검증에 사용한 인벤토리도 저장")
     val.set_defaults(func=cmd_validate)
+
+    app = sub.add_parser("apps", help="앱 패키지(APK·IPA) 정보·권한 추출")
+    add_common_opts(app)
+    app.add_argument("--out-apps", default="", help="앱 목록 CSV 파일 경로")
+    app.set_defaults(func=cmd_apps)
     return p
 
 
@@ -408,7 +439,7 @@ def output_paths(args: argparse.Namespace) -> List[Path]:
         결과 폴더, 명시한 결과 파일과 그 부속 파일(``_errors.csv`` 등), 기준본과 그 스캔 정보.
     """
     paths = [Path(args.out_dir)]
-    for name in ("out", "out_hits", "out_timeline", "out_issues", "out_inventory", "baseline"):
+    for name in ("out", "out_hits", "out_timeline", "out_issues", "out_inventory", "out_apps", "baseline"):
         value = getattr(args, name, "")
         if value:
             f = Path(value)

@@ -5,7 +5,8 @@
 
 - 확장자 위장: PNG 내용인 ``.jpg``(잡아야 함), 무작위 바이트인 ``.txt``(잡아야 함),
   텍스트 뒤에 무작위 데이터를 붙인 ``.txt``(잡아야 함), 정상 PNG·ZIP·텍스트(잡으면 안 됨)
-- 앱 패키지: 일반 ZIP의 이름만 바꾼 ``.apk``(잡아야 함), APK 최소 구조를 갖춘 ``.apk``(잡으면 안 됨)
+- 앱 패키지: 일반 ZIP의 이름만 바꾼 ``.apk``(잡아야 함), 컴파일된 매니페스트를 갖춘 ``.apk``·
+  IPA·``.zip``으로 둔 APK(잡으면 안 됨, ``apps`` 명령에서 정보가 나와야 함)
 - 인코딩 검색: UTF-8, CP949(메모장 ANSI), UTF-16(메모장 유니코드) 한글 메모
 - 해시: 내용이 같은 두 파일, 0바이트 파일, 10MB 파일(조각 단위 해시)
 - 경로: 한글·특수문자 파일명, 깊은 폴더, 심볼릭 링크
@@ -22,13 +23,15 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
 import random
 import shutil
+import struct
 import sys
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_ROOT = BASE_DIR / "ForensicTestData"
@@ -70,6 +73,82 @@ def make_zip(path: Path, members: Dict[str, bytes]) -> None:
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for name, data in members.items():
             zf.writestr(zipfile.ZipInfo(name, date_time=FIXED_ZIP_TIME), data)
+
+
+# 안드로이드 공개 속성의 리소스 ID(android.R.attr). 컴파일된 매니페스트는 속성을 이 ID로 식별한다.
+ANDROID_NS = "http://schemas.android.com/apk/res/android"
+_ATTR_IDS = {"name": 0x01010003, "label": 0x01010001, "versionCode": 0x0101021B, "versionName": 0x0101021C,
+             "minSdkVersion": 0x0101020C, "targetSdkVersion": 0x01010270}
+_NONE = 0xFFFFFFFF
+_TYPE_STRING, _TYPE_INT_DEC = 0x03, 0x10
+
+# (태그, [(android 네임스페이스 여부, 속성 이름, 값)], 자식 요소들)
+Element = Tuple[str, List[Tuple[bool, str, Union[str, int]]], list]
+
+
+def android_manifest_bytes(package: str, version_code: int, version_name: str, min_sdk: int, target_sdk: int,
+                           permissions: Sequence[str], label: str) -> bytes:
+    """빌드 도구(aapt2)가 만드는 것과 같은 형식의 컴파일된 AndroidManifest.xml을 만든다.
+
+    실제 APK를 저장소에 넣지 않고도 APK 정보 추출을 테스트하기 위한 것이다. 구조는
+    파일 헤더 → 문자열 표 → 리소스 ID 표 → 네임스페이스·요소 시작/끝 청크 순서다.
+
+    Args:
+        package: 패키지명.
+        version_code: 버전 코드.
+        version_name: 버전 이름.
+        min_sdk: 최소 SDK.
+        target_sdk: 대상 SDK.
+        permissions: 요청 권한.
+        label: 앱 이름.
+
+    Returns:
+        ``03 00 08 00``으로 시작하는 바이너리 XML.
+    """
+    attr = lambda name, value: (True, name, value)  # noqa: E731
+    root: Element = ("manifest", [(False, "package", package), attr("versionCode", version_code),
+                                  attr("versionName", version_name)],
+                     [("uses-sdk", [attr("minSdkVersion", min_sdk), attr("targetSdkVersion", target_sdk)], [])]
+                     + [("uses-permission", [attr("name", p)], []) for p in permissions]
+                     + [("application", [attr("label", label)], [])])
+
+    # 리소스 ID가 붙는 속성 이름은 문자열 표 맨 앞에 두고, ID 표의 순서와 맞춘다.
+    strings: List[str] = [*_ATTR_IDS, "android", ANDROID_NS]
+
+    def idx(text: str) -> int:
+        if text not in strings:
+            strings.append(text)
+        return strings.index(text)
+
+    def element(node: Element) -> bytes:
+        tag, attrs, children = node
+        body = b""
+        for in_ns, name, value in attrs:
+            ns = idx(ANDROID_NS) if in_ns else _NONE
+            if isinstance(value, str):
+                body += struct.pack("<IIIHBBI", ns, idx(name), idx(value), 8, 0, _TYPE_STRING, idx(value))
+            else:
+                body += struct.pack("<IIIHBBI", ns, idx(name), _NONE, 8, 0, _TYPE_INT_DEC, value)
+        start = struct.pack("<HHIIIIIHHHHHH", 0x0102, 16, 36 + len(body), 1, _NONE, _NONE, idx(tag),
+                            20, 20, len(attrs), 0, 0, 0) + body
+        inner = b"".join(element(c) for c in children)
+        return start + inner + struct.pack("<HHIIIII", 0x0103, 16, 24, 1, _NONE, _NONE, idx(tag))
+
+    ns = struct.pack("<HHIIIII", 0x0100, 16, 24, 1, _NONE, idx("android"), idx(ANDROID_NS))
+    tree = ns + element(root) + struct.pack("<HHIIIII", 0x0101, 16, 24, 1, _NONE, idx("android"), idx(ANDROID_NS))
+
+    data, offsets = b"", []
+    for text in strings:  # UTF-16: 글자 수(2바이트) + 본문 + 끝 표시(2바이트)
+        offsets.append(len(data))
+        data += struct.pack("<H", len(text)) + text.encode("utf-16-le") + b"\x00\x00"
+    data += b"\x00" * (-len(data) % 4)
+    strings_start = 28 + 4 * len(strings)
+    pool = (struct.pack("<HHIIIIII", 0x0001, 28, strings_start + len(data), len(strings), 0, 0, strings_start, 0)
+            + b"".join(struct.pack("<I", o) for o in offsets) + data)
+    res_ids = struct.pack("<HHI", 0x0180, 8, 8 + 4 * len(_ATTR_IDS)) + b"".join(
+        struct.pack("<I", i) for i in _ATTR_IDS.values())
+    content = pool + res_ids + tree
+    return struct.pack("<HHI", 0x0003, 8, 8 + len(content)) + content
 
 
 def set_mtime(path: Path, dt: datetime) -> None:
@@ -118,10 +197,25 @@ def generate(root: Path = DEFAULT_ROOT) -> Path:
     make_zip(bins / "archive.zip", {"inner/readme.txt": b"This is inside zip\n",
                                     "inner/data.bin": rng.randbytes(2048)})
 
-    # 앱 패키지: 최소 구조 APK(컴파일된 매니페스트 헤더 + DEX 헤더) / 일반 ZIP의 이름만 바꾼 APK
+    # 앱 패키지: 컴파일된 매니페스트를 갖춘 APK, ZIP으로 둔 APK, IPA / 일반 ZIP의 이름만 바꾼 APK
     apps = root / "apps"
-    make_zip(apps / "structured_sample.apk", {"AndroidManifest.xml": b"\x03\x00\x08\x00" + bytes(60),
-                                              "classes.dex": b"dex\n035\x00" + bytes(104)})
+    dex = b"dex\n035\x00" + bytes(104)
+    make_zip(apps / "structured_sample.apk", {
+        "AndroidManifest.xml": android_manifest_bytes(
+            "org.example.notes", 7, "1.2.0", 24, 34,
+            ["android.permission.INTERNET", "android.permission.READ_CONTACTS"], "Sample Notes"),
+        "classes.dex": dex})
+    make_zip(apps / "backup.zip", {
+        "AndroidManifest.xml": android_manifest_bytes(
+            "com.example.tracker", 3, "0.9", 21, 30,
+            ["android.permission.ACCESS_FINE_LOCATION", "android.permission.RECEIVE_BOOT_COMPLETED"], "Tracker"),
+        "classes.dex": dex})
+    info = plistlib.dumps({"CFBundleIdentifier": "org.example.photos", "CFBundleDisplayName": "Photos Sample",
+                           "CFBundleShortVersionString": "2.1", "CFBundleVersion": "210", "MinimumOSVersion": "15.0",
+                           "DTPlatformVersion": "17.0", "NSCameraUsageDescription": "사진 촬영",
+                           "NSPhotoLibraryUsageDescription": "앨범 저장"}, fmt=plistlib.FMT_BINARY)
+    make_zip(apps / "sample.ipa", {"Payload/Photos.app/Info.plist": info,
+                                   "Payload/Photos.app/_CodeSignature/CodeResources": b"<plist/>"})
     make_zip(apps / "renamed_archive.apk", {"photos/img_001.jpg": b"\xff\xd8\xff\xe0" + bytes(64)})
 
     # 텍스트·인코딩
