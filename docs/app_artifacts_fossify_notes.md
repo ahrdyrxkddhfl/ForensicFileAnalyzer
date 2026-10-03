@@ -9,7 +9,7 @@
 | 항목 | 값 |
 |---|---|
 | 기기 | 안드로이드 에뮬레이터, Android 14(API 34) `google_apis` arm64 이미지(userdebug, `adb root` 가능) |
-| 앱 | Fossify Notes 1.7.0(versionCode 13), F-Droid 공식 APK. 오픈소스 메모 앱 |
+| 앱 | Fossify Notes 1.7.0(versionCode 13), F-Droid 공식 APK(`org.fossify.notes_13.apk`, SHA-256 `5a56e0e39cc488e1f3b947d3801006d3b7450ec73c67f03195c64c5fd3b6bced`). 오픈소스 메모 앱 |
 | 수집 | 행동마다 `am force-stop`으로 앱을 종료한 뒤 `adb pull -a /data/data/org.fossify.notes` |
 | 분석 | `python main.py appdiff <후> --before <전>` |
 
@@ -122,6 +122,6 @@ adb pull -a /data/data/org.fossify.notes snapshots/<단계>/
 ## 6. 한계
 
 - 에뮬레이터에서 root로 수집했다. 실기기는 루팅이나 백업 등 다른 수집 방법이 필요하다.
-- 한 버전(1.7.0)만 확인했다. 앱이 업데이트되면 테이블 구조나 저장 방식이 바뀔 수 있다.
+- 한 버전(1.7.0)만 확인했다. 앱이 업데이트되면 테이블 구조나 저장 방식이 바뀔 수 있다. 다시 실험할 때는 위 SHA-256으로 같은 APK인지 확인한다. 시각·WAL 크기·해시 값은 실험마다 달라지지만 발견 1~5는 같은 버전이면 재현된다.
 - `adb shell input`은 영문만 입력할 수 있어 메모 내용을 영문으로 썼다.
 - 체크포인트가 일어난 뒤의 WAL 잔존 여부, 체크리스트형 메모, 패턴 잠금은 확인하지 않았다.
