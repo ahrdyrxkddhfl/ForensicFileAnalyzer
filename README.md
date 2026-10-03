@@ -19,6 +19,7 @@
 | `timeline` | 생성·메타데이터 변경·수정·접근 시각을 시간순 사건으로 정렬 | `timeline_*.csv` |
 | `validate` | 인벤토리 무결성 검사, 기준본(`--baseline`)과 비교해 변경·삭제·추가·이동 탐지 | `validate_*.csv` |
 | `apps` | APK·IPA를 확장자와 상관없이 찾아 패키지명·버전·SDK·권한·서명 정보 추출 | `apps_*.csv` |
+| `appdiff` | 앱 행동 전후 데이터 폴더 비교: 파일 추가·삭제·변경과 SQLite 행·설정 키 단위 변화 | `appdiff_*.csv` |
 
 ### ① 파일 인벤토리 & 메타데이터
 
@@ -141,6 +142,31 @@ ZIP 내부 구조(③)로 APK·IPA를 찾으므로 `.zip`으로 둔 앱도 목�
 - 암호화 플래그·지원하지 않는 압축 방식처럼 분석을 방해하는 ZIP 조작이 있어도, 안드로이드처럼 읽어 정보를 뽑는다. 이때 `structure_ok=False`와 구조 확인 결과(`structure_desc`)를 함께 남긴다.
 - 확장자가 `.apk`·`.ipa`인 파일은 결과에서 빼지 않는다. 앱 표식이 없으면 `status=not_app`, 파일이나 정보를 읽지 못하면 `parse_error`로 남긴다.
 
+### ⑧ 앱 행동 전후 비교 (아티팩트 명세)
+
+앱에서 메모 작성 같은 행동을 하기 전과 후에 앱 데이터 폴더를 각각 수집해 두고 비교하면, "이 행동을 하면 이 파일의 이 부분이 생기거나 바뀐다"를 찾을 수 있다.
+
+```bash
+python main.py appdiff snapshots/after --before snapshots/before
+```
+
+| 대상(앞부분 바이트로 판별) | 비교 단위 | `change` |
+|---|---|---|
+| 모든 파일 | `rel_path`로 짝지어 SHA-256 비교 | `FILE_ADDED` / `FILE_DELETED` / `FILE_MODIFIED` |
+| SQLite DB | 테이블별 행(rowid, 없으면 기본 키로 짝지음). 변경은 열 단위 | `TABLE_ADDED` / `ROW_ADDED` / `ROW_DELETED` / `ROW_CHANGED` |
+| 설정 XML(`shared_prefs`의 `<map>`) | 키(값에 타입 포함, 예: `boolean:true`) | `KEY_ADDED` / `KEY_DELETED` / `KEY_CHANGED` |
+| plist(XML·바이너리) | 중첩 키를 `a.b[0]` 경로로 펼친 키 | 위와 같음 |
+
+- **WAL 반영**: 안드로이드 앱 DB는 대부분 WAL 모드라 최근 변경이 `-wal` 파일에 먼저 쌓인다. 본 DB 파일만 읽으면 방금 쓴 메모가 보이지 않는다. 그래서 DB와 `-wal`을 함께 읽고, `-wal`만 바뀐 경우도 본 DB의 행 변화로 보여 준다.
+- **원본을 열지 않음**: SQLite는 DB를 열면 옆에 `-shm`을 만들고, 닫을 때 WAL을 본 파일에 합친다. 원본을 직접 열면 증거가 바뀌므로 임시 사본에서 연다(테스트로 원본이 바이트 단위로 그대로인지 확인).
+- 깨진 DB·설정 파일은 멈추지 않고 `PARSE_ERROR`로 남긴다. 값이 길면 앞 300자와 원래 길이를, BLOB은 16진수로 남긴다.
+
+**실제 앱으로 만든 명세**: 안드로이드 에뮬레이터에서 오픈소스 메모 앱 Fossify Notes로 작성·수정·삭제·잠금을 하고 행동마다 수집해 비교했다 → [docs/app_artifacts_fossify_notes.md](docs/app_artifacts_fossify_notes.md). 수집본은 [samples/fossify_notes](samples/fossify_notes)에 있다. 확인한 것:
+
+- 메모 내용은 전부 `notes.db-wal`에 있고 본 DB 파일은 헤더뿐이다(WAL을 빼면 메모가 하나도 안 보임).
+- 수정 전·삭제된 메모 본문이 WAL의 이전 프레임에 원시 바이트로 남는다.
+- 메모 잠금 PIN은 솔트 없는 SHA-1로 저장되어 4자리 PIN이 즉시 복원되고, 잠긴 메모의 본문은 평문이다.
+
 ### 결과 CSV 보안
 
 파일명은 증거를 만든 사람이 마음대로 정할 수 있다. `=HYPERLINK(...)`처럼 엑셀 수식으로 시작하는 값은 앞에 `'`를 붙여 결과 CSV를 여는 분석가 PC에서 수식이 실행되지 않게 하고(CSV 수식 주입 방지), 기준본으로 다시 읽을 때는 원래 값으로 되돌린다. 원래부터 `'`로 시작하는 파일명에도 `'`를 하나 더 붙여, 되돌릴 때 원래 이름과 정확히 같아지게 한다. `--label`은 파일명에 안전한 문자만 남기며, 같은 초에 다시 실행해도 이전 결과를 덮어쓰지 않는다.
@@ -160,6 +186,7 @@ python main.py search    ForensicTestData --kw error --kw 비밀번호
 python main.py timeline  ForensicTestData --tz-offset-min 540
 python main.py validate  ForensicTestData --with-hash --verify-hash --with-signature
 python main.py apps      ForensicTestData --with-hash
+python main.py appdiff   snapshots/after --before snapshots/before   # 앱 행동 전후 수집본 비교
 
 # 변경 탐지: 수집 시점의 인벤토리를 기준본으로 저장해 두고 나중에 비교
 python main.py inventory ForensicTestData --with-hash --out outputs/baseline.csv
@@ -223,6 +250,7 @@ python -m pytest -q
 | `test_inventory_hashing.py` | 정렬·상대 경로, 심볼릭 링크 정책, 순환 링크, OS별 시간 필드, 해시 상태 |
 | `test_search_timeline.py` | 인코딩별 검색, 줄마다 인코딩이 다른 로그(무작위로 섞은 파일 40개를 원문과 비교), 잘린·깨진 파일 검색, 줄 번호, 건너뛴 파일 기록, 수상한 시각 |
 | `test_validate.py` | 변조·이동·삭제 판정, 해시 없는 기준본, NFD 파일명, CSV 수식 주입 왕복 |
+| `test_artifactdiff.py` | WAL에만 있는 행 탐지, 원본 무변경, `-wal`만 바뀐 경우, WITHOUT ROWID 테이블, 설정 XML·plist 키 비교, 깨진 파일 |
 | `test_appinfo.py` | APK·IPA 정보 추출, `.zip`으로 둔 앱, 분석 방해 ZIP 조작이 있는 APK, 깨진 plist, androguard가 없을 때 |
 | `test_cli.py` | 잘못된 입력 사전 차단, 결과 폴더 자동 제외, 스캔 옵션 비교, 더미 데이터 전체 결과 |
 
@@ -240,9 +268,12 @@ forensic_analyzer/
   timeline.py                타임라인
   validate.py                검증, 기준본 비교
   appinfo.py                 앱 패키지(APK·IPA) 정보·권한 추출
+  artifactdiff.py            앱 행동 전후 수집본 비교(SQLite 행, 설정 키)
   foroutput.py               CSV 저장(원자적 저장, 수식 주입 방지)
   dummy_test.py              테스트용 더미 증거 생성
 tests/                       pytest
+samples/fossify_notes/       실제 앱(에뮬레이터) 행동별 수집본
+docs/                        트러블슈팅, 앱 아티팩트 명세
 ```
 
 ## 7. 한계
@@ -260,13 +291,15 @@ tests/                       pytest
 11. 시그니처 판별은 파일 앞부분을 인코딩 하나로 판정하므로, UTF-8 줄과 CP949 줄이 뒤섞인 로그는 "알 수 없는 바이너리"로 보고 확장자 불일치 경고를 낼 수 있다. 검색은 줄 단위로 읽으므로 이런 파일에서도 키워드를 정상적으로 찾는다.
 12. ZIP 내부 구조 확인은 패키지 구조 수준이다. APK 서명 검증이나 코드(DEX) 디컴파일은 하지 않는다. 문서(DOCX 등)는 필수 파일 이름까지만 보므로, 이름을 맞춰 일부러 만든 ZIP은 통과할 수 있다. AAB·XAPK·JAR 등 그 밖의 ZIP 계열은 내부 구조를 확인하지 않고 ZIP 계열 확장자로만 허용한다.
 13. 앱 정보는 패키지에 적힌 값을 읽는 수준이다. APK 서명은 있는지(방식)만 보고 인증서를 검증하지 않으며, 코드 디컴파일·동적 분석은 하지 않는다. App Store에서 받은 IPA의 실행 파일 암호화(FairPlay) 여부도 확인하지 않는다. 앱 이름이 리소스 참조인데 리소스가 조작되면 `app_name`이 비어 있을 수 있다. 압축 안의 압축에 든 앱(XAPK·APKS 묶음, ZIP 안의 APK)은 찾지 않는다. androguard는 APK 전체를 메모리에 올리므로 수 GB 크기의 APK는 메모리를 많이 쓴다.
+14. `appdiff`는 DB의 **현재 상태**끼리 비교한다. 삭제된 레코드가 남아 있는 빈 페이지나 WAL의 이전 프레임은 복구하지 않는다. 행을 rowid로 짝지으므로, 삭제 후 같은 rowid로 다시 넣은 행은 "변경"으로 보인다. SQLite·설정 XML·plist가 아닌 형식(예: DataStore의 protobuf)은 파일 단위 변화만 보여 준다. DB 내용을 모두 메모리에 올려 비교하므로 수 GB짜리 DB는 메모리를 많이 쓴다. 심볼릭 링크는 비교하지 않는다. UTF-8로 읽히지 않는 글자는 대체 문자로 바꿔 비교하므로 깨진 바이트끼리만 다른 변경은 놓친다. `--with-hash`·`--with-signature` 등 공통 옵션은 `appdiff`에서 쓰지 않는다(파일 비교에는 항상 SHA-256을 쓴다).
 
 ## 8. 향후 보완점
 
-1. 앱 동작 전후 데이터 폴더 비교 결과를 SQLite 테이블·설정 파일 키 단위로 표시
+1. 다른 앱(메신저·브라우저 등)으로 아티팩트 명세 확대
 2. 이미지(EXIF)·문서 내부 상세 분석
 3. 디스크 이미지(E01, dd) 직접 분석
 4. 검색 인덱스로 대용량 검색 속도 향상
+5. SQLite 삭제 레코드(빈 페이지·WAL 이전 프레임) 복구
 
 ### 관련 학습 내용 정리
 

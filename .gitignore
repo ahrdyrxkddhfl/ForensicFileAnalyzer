@@ -27,3 +27,6 @@ outputs/*
 
 # 개인 면접 준비 자료 (코드 해설서, 공개 저장소에 올리지 않음)
 docs/interview*
+
+# Claude Code 개인 설정
+.claude/settings.local.json

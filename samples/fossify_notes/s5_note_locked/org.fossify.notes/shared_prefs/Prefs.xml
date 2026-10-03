@@ -1,0 +1,19 @@
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<map>
+    <string name="internal_storage_path">/storage/emulated/0</string>
+    <boolean name="is_global_theme_enabled" value="false" />
+    <int name="password_retry_count" value="0" />
+    <int name="app_sideloading_status" value="2" />
+    <boolean name="show_checkmarks_on_switches" value="false" />
+    <long name="last_unlock_timestamp_ms" value="1790987565539" />
+    <int name="last_version" value="13" />
+    <long name="current_note_id" value="1" />
+    <string name="sd_card_path_2"></string>
+    <boolean name="was_orange_icon_checked" value="true" />
+    <int name="last_created_note_type" value="0" />
+    <long name="password_count_down_start_ms" value="0" />
+    <int name="app_run_count" value="5" />
+    <string name="app_id">org.fossify.notes</string>
+    <int name="last_handled_shortcut_color" value="-15700705" />
+    <long name="widget_note_id" value="1" />
+</map>

@@ -7,6 +7,7 @@
     timeline   파일 시간 정보로 시간순 사건 목록 생성
     validate   인벤토리 검증과 기준본(예전 인벤토리) 비교
     apps       앱 패키지(APK·IPA)를 확장자와 상관없이 찾아 패키지명·버전·권한 기록
+    appdiff    앱 행동 전후 데이터 폴더 비교(SQLite 행, 설정 XML·plist 키 단위)
 
 모든 입력값은 스캔을 시작하기 전에 검사한다. 긴 스캔이 끝난 뒤에야 잘못된 옵션
 때문에 실패하거나, 오타 난 경로를 "파일 없는 폴더"로 오해하는 일을 막기 위함이다.
@@ -15,6 +16,7 @@ Example:
     $ python main.py inventory ForensicTestData --with-hash --with-signature
     $ python main.py validate ForensicTestData --baseline outputs/baseline.csv
     $ python main.py apps ForensicTestData --with-hash
+    $ python main.py appdiff snapshots/after --before snapshots/before
 """
 from __future__ import annotations
 
@@ -30,6 +32,7 @@ from typing import Dict, List, Optional, Sequence
 
 from forensic_analyzer import __version__
 from forensic_analyzer.appinfo import APP_FIELDS, collect_app_rows
+from forensic_analyzer.artifactdiff import DIFF_FIELDS, diff_snapshots
 from forensic_analyzer.foroutput import ensure_dir, make_outpath, meta_path_for, write_json, write_rows_csv
 from forensic_analyzer.hashing import add_hashes_to_rows
 from forensic_analyzer.inventory import INVENTORY_FIELDS, KIND_SYMLINK_CYCLE, collect_inventory
@@ -278,6 +281,25 @@ def cmd_apps(args: argparse.Namespace) -> None:
     report_scan_errors(errors, out_path)
 
 
+def cmd_appdiff(args: argparse.Namespace) -> None:
+    """appdiff: 행동 전(``--before``)과 후(``root``) 수집본을 비교해 바뀐 파일과 내용을 저장한다.
+
+    Args:
+        args: 파싱된 명령줄 인자.
+    """
+    print(f"[INFO] appdiff before={args.before} after={args.root}")
+    errors: List[Dict[str, str]] = []
+    rows = diff_snapshots(args.before, args.root, exclude_globs=args.exclude, errors=errors)
+    out_path = Path(args.out_diff) if args.out_diff else make_outpath("appdiff", ensure_dir(Path(args.out_dir)), args.label)
+    write_rows_csv(rows, out_path, preferred=DIFF_FIELDS)
+    counts: Dict[str, int] = {}
+    for r in rows:
+        counts[str(r["change"])] = counts.get(str(r["change"]), 0) + 1
+    print(f"[OK] {len(rows)} changes -> {out_path}")
+    print("[SUMMARY]", ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "변화 없음")
+    report_scan_errors(errors, out_path)
+
+
 # ---------------------------------------------------------------------------
 # 인자 파싱과 사전 검사
 # ---------------------------------------------------------------------------
@@ -344,6 +366,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_opts(app)
     app.add_argument("--out-apps", default="", help="앱 목록 CSV 파일 경로")
     app.set_defaults(func=cmd_apps)
+
+    adf = sub.add_parser("appdiff", help="앱 행동 전후 데이터 폴더 비교")
+    add_common_opts(adf)
+    adf.add_argument("--before", required=True, help="행동 전에 수집한 폴더(root는 행동 후 폴더)")
+    adf.add_argument("--out-diff", default="", help="비교 결과 CSV 파일 경로")
+    adf.set_defaults(func=cmd_appdiff)
     return p
 
 
@@ -418,6 +446,9 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
     if args.command == "timeline" and args.tz_offset_min is not None and not -1439 <= args.tz_offset_min <= 1439:
         parser.error("--tz-offset-min은 -1439~1439 사이여야 합니다")
 
+    if args.command == "appdiff" and not Path(args.before).is_dir():
+        parser.error(f"--before 경로가 없거나 폴더가 아닙니다: {args.before}")
+
     if args.command == "validate" and args.baseline:
         if not Path(args.baseline).is_file():
             parser.error(f"기준본 CSV를 찾을 수 없습니다: {args.baseline}")
@@ -439,7 +470,7 @@ def output_paths(args: argparse.Namespace) -> List[Path]:
         결과 폴더, 명시한 결과 파일과 그 부속 파일(``_errors.csv`` 등), 기준본과 그 스캔 정보.
     """
     paths = [Path(args.out_dir)]
-    for name in ("out", "out_hits", "out_timeline", "out_issues", "out_inventory", "out_apps", "baseline"):
+    for name in ("out", "out_hits", "out_timeline", "out_issues", "out_inventory", "out_apps", "out_diff", "baseline"):
         value = getattr(args, name, "")
         if value:
             f = Path(value)
